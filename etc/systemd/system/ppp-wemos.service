@@ -1,0 +1,12 @@
+[Unit]
+Description=PPP link to Wemos via ttyUSB0
+After=network.target
+Requires=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ppp-wemos.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

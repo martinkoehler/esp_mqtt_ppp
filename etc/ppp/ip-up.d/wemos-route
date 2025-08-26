@@ -1,0 +1,5 @@
+#!/bin/bash
+# $1 = interface name (should be ppp0)
+if [ "$1" = "ppp0" ]; then
+    /sbin/ip route add 192.168.4.0/24 via 192.168.178.50 dev ppp0
+fi
