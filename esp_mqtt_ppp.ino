@@ -2,16 +2,19 @@
 #include <uMQTTBroker.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
-
 extern "C" {
   #include "lwip/opt.h"
   #include "lwip/err.h"
   #include "lwip/ip_addr.h"
+  #include "lwip/netif.h"
   #include "netif/ppp/ppp.h"
   #include "netif/ppp/pppos.h"
+  #include "lwip/etharp.h"
+  #include "lwip/ip4.h"
+  #include "lwip/ip4_route.h"
+  #include "lwip/ip4_nat.h"     // <-- Add this header for NAT
 }
 
-// ===== Persistent AP config =====
 #define EEPROM_SIZE 128
 #define SSID_ADDR   0
 #define PASS_ADDR   32
@@ -48,6 +51,7 @@ public:
 // ===== PPPoS bits =====
 static ppp_pcb *ppp = nullptr;
 static struct netif ppp_netif;
+static struct netif *ap_netif = nullptr; // for NAT
 
 static u32_t ppp_output_cb(ppp_pcb *pcb, u8_t *data, u32_t len, void *ctx) {
   return Serial.write(data, len);
@@ -60,6 +64,11 @@ static void ppp_status_cb(ppp_pcb *pcb, int err_code, void *ctx) {
     const ip_addr_t* mk = netif_ip_netmask4(&ppp_netif);
     Serial1.printf("[PPP] UP  ip=%s gw=%s mask=%s\n",
                    ipaddr_ntoa(ip), ipaddr_ntoa(gw), ipaddr_ntoa(mk));
+    // Setup NAT if PPP is up
+    if (ap_netif) {
+      ip_napt_enable(netif_ip4_addr(&ppp_netif)->addr, 1); // Enable NAT
+      Serial1.println("[NAT] enabled on PPP interface");
+    }
   } else {
     Serial1.printf("[PPP] status err=%d\n", err_code);
   }
@@ -138,6 +147,17 @@ void setupAP() {
   } else {
     Serial1.printf("[AP] %s up at %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
   }
+  // Get the AP netif pointer for NAT
+  ap_netif = netif_list;
+  while (ap_netif) {
+    if (ip4_addr_cmp(netif_ip4_addr(ap_netif), (ip4_addr*)&ap_ip)) break;
+    ap_netif = ap_netif->next;
+  }
+  if (ap_netif) {
+    Serial1.println("[AP] netif found for NAT");
+  } else {
+    Serial1.println("[AP] netif NOT found, NAT may not work");
+  }
 }
 
 void setupPPP() {
@@ -178,6 +198,11 @@ void setup() {
   setupPPP();
   setupMQTT();
   setupWeb();
+
+  // Enable global IP forwarding (required for routing)
+  extern int ip_forward; // lwIP global
+  ip_forward = 1;
+  Serial1.println("[ROUTER] IP forwarding enabled");
 }
 
 void loop() {
@@ -194,4 +219,3 @@ void loop() {
   server.handleClient();
   delay(1);
 }
-
