@@ -1,0 +1,20 @@
+# Persistence in FREETZ-NG
+How to persist `/etc/ppp/peers/wemos` in a FREETZ(-NG) image
+By default, `/etc/ppp/peers/wemos` is in RAM and will be lost after reboot unless you include it in your Freetz image or use the Freetz mod filesystem.
+Recommended:
+
+Add your custom peer file to your Freetz build (so it’s included in the firmware and survives reboots).
+Use rc.custom for runtime scripts.
+
+A. Add /etc/ppp/peers/wemos to your Freetz-NG build:
+On your build host, create the file in `root/etc/ppp/peers/` in your Freetz-NG build directory:
+```sh
+mkdir -p root/etc/ppp/peers
+nano root/etc/ppp/peers/wemos
+``` 
+Build your Freetz(-NG) image as usual.
+The file will be included in the firmware and available after every reboot.
+
+B. Alternatively: Use the mod filesystem (for testing or changes after flashing)
+Place (or upload) the file to /var/mod/etc/ppp/peers/wemos via SSH, FTP, or the Freetz web interface (File Editor or File Manager plugin).
+If you want persistence after reboot, make sure your mod filesystem is enabled and persistent.

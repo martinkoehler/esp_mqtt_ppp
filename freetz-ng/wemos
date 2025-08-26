@@ -1,0 +1,17 @@
+115200
+/dev/ttyUSB0
+local
+persist
+noauth
+proxyarp
+nobsdcomp
+nodeflate
+novj
+nopcomp
+noaccomp
+# Assign IPs: Fritz!Box (local): Wemos (remote)
+192.168.178.1:192.168.178.50
+# Optional: Give DNS to the Wemos if it needs it
+ms-dns 192.168.178.1
+# Optional: Enable debug for troubleshooting
+# debug

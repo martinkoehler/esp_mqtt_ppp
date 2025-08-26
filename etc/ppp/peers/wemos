@@ -1,0 +1,21 @@
+115200
+local
+lock
+persist
+noauth
+debug
+# Hand out a LAN IP to the peer (Wemos):
+192.168.178.60:192.168.178.50
+# Make the Wemos reachable from the LAN with plain ARP:
+proxyarp
+# Keep it simple (no fancy compressions):
+nobsdcomp
+nodeflate
+novj
+nopcomp
+noaccomp
+# Accept whatever we offer
+ipcp-accept-local
+ipcp-accept-remote
+# Optional: set DNS the peer will see (not critical here)
+ms-dns 192.168.178.1

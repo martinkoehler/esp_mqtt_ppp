@@ -1,0 +1,11 @@
+#!/bin/sh
+stty -F /dev/ttyUSB0 115200 -echo -ixon -ixoff -crtscts raw
+/usr/sbin/pppd call wemos
+
+# Wait for PPP to establish
+sleep 10
+
+# NAT for Wemos subnet to WAN
+iptables -t nat -A POSTROUTING -o lan -s 192.168.4.0/24 -j MASQUERADE
+
+exit 0
