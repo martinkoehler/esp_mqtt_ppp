@@ -11,8 +11,9 @@ extern "C" {
   #include "netif/ppp/pppos.h"
   #include "lwip/etharp.h"
   #include "lwip/ip4.h"
-  #include "lwip/ip4_route.h"
-  #include "lwip/ip4_nat.h"     // <-- Add this header for NAT
+  #include "lwip/ip4.h"
+  #include "lwip/ip4_addr.h" 
+  #include "lwip/napt.h"     // <<— ADD THIS
 }
 
 #define EEPROM_SIZE 128
@@ -20,6 +21,16 @@ extern "C" {
 #define PASS_ADDR   32
 #define MAX_SSID    31
 #define MAX_PASS    31
+
+// ===== NAT (NAPT) config =====
+#ifndef IP_NAPT_MAX
+#define IP_NAPT_MAX     512   // number of NAT table entries
+#endif
+#ifndef IP_PORTMAP_MAX
+#define IP_PORTMAP_MAX  32    // number of explicit port maps (if you add any)
+#endif
+static bool napt_inited = false;
+
 
 char ap_ssid[MAX_SSID+1] = "APSSID";
 char ap_pass[MAX_PASS+1] = "APPW12345670";
@@ -51,7 +62,6 @@ public:
 // ===== PPPoS bits =====
 static ppp_pcb *ppp = nullptr;
 static struct netif ppp_netif;
-static struct netif *ap_netif = nullptr; // for NAT
 
 static u32_t ppp_output_cb(ppp_pcb *pcb, u8_t *data, u32_t len, void *ctx) {
   return Serial.write(data, len);
@@ -64,15 +74,32 @@ static void ppp_status_cb(ppp_pcb *pcb, int err_code, void *ctx) {
     const ip_addr_t* mk = netif_ip_netmask4(&ppp_netif);
     Serial1.printf("[PPP] UP  ip=%s gw=%s mask=%s\n",
                    ipaddr_ntoa(ip), ipaddr_ntoa(gw), ipaddr_ntoa(mk));
-    // Setup NAT if PPP is up
-    if (ap_netif) {
-      ip_napt_enable(netif_ip4_addr(&ppp_netif)->addr, 1); // Enable NAT
-      Serial1.println("[NAT] enabled on PPP interface");
+
+    // ---- NAT enable on the PPP (WAN) interface ----
+    if (!napt_inited) {
+      ip_napt_init(IP_NAPT_MAX, IP_PORTMAP_MAX);
+      napt_inited = true;
+      Serial1.printf("[NAT] NAPT initialized (max=%d, portmaps=%d)\n",
+                     IP_NAPT_MAX, IP_PORTMAP_MAX);
     }
+    // Mark PPP as the external (NAT) interface
+    u32_t ppp_addr = ip4_addr_get_u32(netif_ip4_addr(&ppp_netif));
+    if (!napt_inited) {
+      ip_napt_init(IP_NAPT_MAX, IP_PORTMAP_MAX);
+      napt_inited = true;
+      Serial1.printf("[NAT] NAPT initialized (max=%d, portmaps=%d)\n", IP_NAPT_MAX, IP_PORTMAP_MAX);
+    }
+    if (ip_napt_enable(ppp_addr, 1) == ERR_OK) {
+      Serial1.printf("[NAT] enabled on PPP address %s\n", ipaddr_ntoa(netif_ip_addr4(&ppp_netif)));
+    } else {
+    Serial1.println("[NAT] enable failed");
+    }
+    Serial1.println("[NAT] enabled on PPP (outbound masquerade)");
   } else {
     Serial1.printf("[PPP] status err=%d\n", err_code);
   }
 }
+
 
 // ===== Web server =====
 ESP8266WebServer server(80);
@@ -147,17 +174,6 @@ void setupAP() {
   } else {
     Serial1.printf("[AP] %s up at %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
   }
-  // Get the AP netif pointer for NAT
-  ap_netif = netif_list;
-  while (ap_netif) {
-    if (ip4_addr_cmp(netif_ip4_addr(ap_netif), (ip4_addr*)&ap_ip)) break;
-    ap_netif = ap_netif->next;
-  }
-  if (ap_netif) {
-    Serial1.println("[AP] netif found for NAT");
-  } else {
-    Serial1.println("[AP] netif NOT found, NAT may not work");
-  }
 }
 
 void setupPPP() {
@@ -198,11 +214,6 @@ void setup() {
   setupPPP();
   setupMQTT();
   setupWeb();
-
-  // Enable global IP forwarding (required for routing)
-  extern int ip_forward; // lwIP global
-  ip_forward = 1;
-  Serial1.println("[ROUTER] IP forwarding enabled");
 }
 
 void loop() {
@@ -217,5 +228,6 @@ void loop() {
     }
   }
   server.handleClient();
-  delay(1);
+  yield();
 }
+

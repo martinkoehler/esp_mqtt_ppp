@@ -3,7 +3,12 @@ esp8266 (wemos D1) STA with mqtt broker and ppp connection.
 The Wemos opens an WLAN Access point where clients can connect to and access the wemos MQTT Broker.
 
 ## Prerequisites
-Need uBroker from [martin-ger](https://github.com/martin-ger/uMQTTBroker) and lwip with NAT support
+Need uMQTTBroker from [martin-ger](https://github.com/martin-ger/uMQTTBroker) and lwip with NAT support
+
+You can use the arduino IDE to compile & flash.
+Tested with Board manager "ESP8266 by ESP8266 community" version 3.1.2 and "lwip v2 High bandwidth". The board I seelcted is "Lolin(Wemos) D1 R2 & mini"
+For the uMQTTBroker library it is the easiest way to download the .zip file from github and include in the arduino IDE via Sketch -> Include library -> Add .ZIP Library.
+
 
 ## Usage
 The Wemos is connected to the host via USB using the built in ch341 chip. The "endpoint" on the host is usually something like /dev/ttyUSB0.
