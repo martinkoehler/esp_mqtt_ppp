@@ -13,14 +13,17 @@ extern "C" {
   #include "lwip/ip4.h"
   #include "lwip/ip4.h"
   #include "lwip/ip4_addr.h" 
-  #include "lwip/napt.h"     // <<— ADD THIS
+  #include "lwip/napt.h"
+  #include "user_interface.h"
 }
+
 
 #define EEPROM_SIZE 128
 #define SSID_ADDR   0
 #define PASS_ADDR   32
 #define MAX_SSID    31
 #define MAX_PASS    31
+
 
 // ===== NAT (NAPT) config =====
 #ifndef IP_NAPT_MAX
@@ -96,7 +99,8 @@ static void ppp_status_cb(ppp_pcb *pcb, int err_code, void *ctx) {
     }
     Serial1.println("[NAT] enabled on PPP (outbound masquerade)");
   } else {
-    Serial1.printf("[PPP] status err=%d\n", err_code);
+    Serial1.printf("[PPP] err=%d -> reconnect\n", err_code);
+    ppp_connect(ppp, 0);
   }
 }
 
@@ -169,7 +173,7 @@ void handleReset() {
 void setupAP() {
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(ap_ip, ap_gw, ap_mask);
-  if (!WiFi.softAP(ap_ssid, ap_pass, AP_CHAN, false, 8)) {
+  if (!WiFi.softAP(ap_ssid, ap_pass, AP_CHAN, false, 4)) { // instead of 8 to save power
     Serial1.println("[AP] start FAILED");
   } else {
     Serial1.printf("[AP] %s up at %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
@@ -206,14 +210,27 @@ void setupWeb() {
   Serial1.println("[WEB] HTTP server started on port 80");
 }
 
+// ====== Power optimisation =====
+void tuneAP() {
+  softap_config conf{};
+  wifi_softap_get_config(&conf);
+  conf.beacon_interval = 400;   // default 100 ms; 200–400 is a good balance
+  wifi_softap_set_config_current(&conf);
+  system_update_cpu_freq(80);   // use lowest stable clock
+}
+
+
 void setup() {
   Serial1.begin(74880);
   delay(100);
   loadAPConfig();
   setupAP();
+  //WiFi.setOutputPower(12.0f);   // adjust after site test
+  tuneAP();                     // set beacon interval
   setupPPP();
   setupMQTT();
   setupWeb();
+  wifi_set_sleep_type(LIGHT_SLEEP_T);
 }
 
 void loop() {
@@ -224,10 +241,10 @@ void loop() {
       int n = Serial.readBytes(buf, (avail > (int)sizeof(buf)) ? sizeof(buf) : avail);
       if (n > 0) {
         pppos_input(ppp, buf, n);
+        if (avail > 128) delay(0); // brief cooperative idle after bursts
       }
     }
   }
   server.handleClient();
   yield();
 }
-
