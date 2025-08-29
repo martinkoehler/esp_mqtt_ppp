@@ -3,15 +3,18 @@
 local
 persist
 noauth
-proxyarp
-nobsdcomp
-nodeflate
+nocrtscts
 novj
+nobsdcomp
 nopcomp
 noaccomp
-# Assign IPs: Fritz!Box (local): Wemos (remote)
+asyncmap 0xa0000
+escape 0x11,0x13,0x7d,0x7e
+ipcp-accept-local
+ipcp-accept-remote
 192.168.178.1:192.168.178.50
-# Optional: Give DNS to the Wemos if it needs it
 ms-dns 192.168.178.1
+# optional, if your Wemos needs a kick:
+# connect '/bin/sh -c "echo -e CLIENT; sleep 1"'
 # Optional: Enable debug for troubleshooting
 # debug
