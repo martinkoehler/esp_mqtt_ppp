@@ -1,7 +1,9 @@
+// esp_mqtt_ppp_fixed.ino
 #include <ESP8266WiFi.h>
 #include <uMQTTBroker.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
+
 extern "C" {
   #include "lwip/opt.h"
   #include "lwip/err.h"
@@ -11,19 +13,16 @@ extern "C" {
   #include "netif/ppp/pppos.h"
   #include "lwip/etharp.h"
   #include "lwip/ip4.h"
-  #include "lwip/ip4.h"
-  #include "lwip/ip4_addr.h" 
+  #include "lwip/ip4_addr.h"
   #include "lwip/napt.h"
   #include "user_interface.h"
 }
-
 
 #define EEPROM_SIZE 128
 #define SSID_ADDR   0
 #define PASS_ADDR   32
 #define MAX_SSID    31
 #define MAX_PASS    31
-
 
 // ===== NAT (NAPT) config =====
 #ifndef IP_NAPT_MAX
@@ -33,7 +32,7 @@ extern "C" {
 #define IP_PORTMAP_MAX  32    // number of explicit port maps (if you add any)
 #endif
 static bool napt_inited = false;
-
+static bool portmap_set = false;
 
 char ap_ssid[MAX_SSID+1] = "APSSID";
 char ap_pass[MAX_PASS+1] = "APPW12345670";
@@ -45,12 +44,13 @@ class MyBroker : public uMQTTBroker {
 public:
   bool onConnect(IPAddress addr, uint16_t client_count) override {
     Serial1.printf("[MQTT] +client %s (n=%u)\n", addr.toString().c_str(), client_count);
-    return true;
+    return true; // accept all clients
   }
   void onDisconnect(IPAddress addr, String client_id) override {
     Serial1.printf("[MQTT] -client %s id=%s\n", addr.toString().c_str(), client_id.c_str());
   }
   bool onAuth(String username, String password, String client_id) override {
+    // no auth
     return true;
   }
   void onData(String topic, const char *data, uint32_t length) override {
@@ -85,25 +85,37 @@ static void ppp_status_cb(ppp_pcb *pcb, int err_code, void *ctx) {
       Serial1.printf("[NAT] NAPT initialized (max=%d, portmaps=%d)\n",
                      IP_NAPT_MAX, IP_PORTMAP_MAX);
     }
-    // Mark PPP as the external (NAT) interface
+
     u32_t ppp_addr = ip4_addr_get_u32(netif_ip4_addr(&ppp_netif));
-    if (!napt_inited) {
-      ip_napt_init(IP_NAPT_MAX, IP_PORTMAP_MAX);
-      napt_inited = true;
-      Serial1.printf("[NAT] NAPT initialized (max=%d, portmaps=%d)\n", IP_NAPT_MAX, IP_PORTMAP_MAX);
-    }
     if (ip_napt_enable(ppp_addr, 1) == ERR_OK) {
-      Serial1.printf("[NAT] enabled on PPP address %s\n", ipaddr_ntoa(netif_ip_addr4(&ppp_netif)));
+      Serial1.printf("[NAT] enabled on PPP address %s\n",
+                     ipaddr_ntoa(netif_ip_addr4(&ppp_netif)));
     } else {
-    Serial1.println("[NAT] enable failed");
+      Serial1.println("[NAT] enable failed");
     }
+
+    // ---- Port-forward PPP:1883 -> AP:1883 (MQTT) ----
+    if (!portmap_set) {
+      ip4_addr_t ap4;
+      IP4_ADDR(&ap4, ap_ip[0], ap_ip[1], ap_ip[2], ap_ip[3]);
+      u32_t ap_addr = ip4_addr_get_u32(&ap4);
+
+      // Forward MQTT (TCP)
+      ip_portmap_add(IP_PROTO_TCP, ppp_addr, 1883, ap_addr, 1883);
+
+      // Optional: expose HTTP status page via PPP as well
+      // ip_portmap_add(IP_PROTO_TCP, ppp_addr, 80, ap_addr, 80);
+
+      portmap_set = true;
+      Serial1.println("[NAT] portmap PPP:1883 -> 192.168.4.1:1883 set");
+    }
+
     Serial1.println("[NAT] enabled on PPP (outbound masquerade)");
   } else {
     Serial1.printf("[PPP] err=%d -> reconnect\n", err_code);
     ppp_connect(ppp, 0);
   }
 }
-
 
 // ===== Web server =====
 ESP8266WebServer server(80);
@@ -148,7 +160,6 @@ void handleRoot() {
 
   html += "<h2>Reset Wemos</h2>";
   html += "<form method='POST' action='/reset'><input type='submit' value='Reboot'></form>";
-
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -173,7 +184,7 @@ void handleReset() {
 void setupAP() {
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(ap_ip, ap_gw, ap_mask);
-  if (!WiFi.softAP(ap_ssid, ap_pass, AP_CHAN, false, 4)) { // instead of 8 to save power
+  if (!WiFi.softAP(ap_ssid, ap_pass, AP_CHAN, false, 4)) { // limit to 4 clients to save power
     Serial1.println("[AP] start FAILED");
   } else {
     Serial1.printf("[AP] %s up at %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
@@ -197,7 +208,7 @@ void setupPPP() {
 }
 
 void setupMQTT() {
-  broker.init();
+  broker.init(); // must be followed by broker.loop() in loop()
   broker.publish("wemos/status", "online", 0, true);
   Serial1.println("[MQTT] broker up on :1883");
 }
@@ -216,17 +227,16 @@ void tuneAP() {
   wifi_softap_get_config(&conf);
   conf.beacon_interval = 400;   // default 100 ms; 200–400 is a good balance
   wifi_softap_set_config_current(&conf);
-  system_update_cpu_freq(80);   // use lowest stable clock
+  system_update_cpu_freq(80);   // lowest stable clock
 }
 
-
 void setup() {
-  Serial1.begin(74880);
+  Serial1.begin(74880);         // TX-only UART1 for logs
   delay(100);
   loadAPConfig();
   setupAP();
-  //WiFi.setOutputPower(12.0f);   // adjust after site test
-  tuneAP();                     // set beacon interval
+  // WiFi.setOutputPower(12.0f); // optional
+  tuneAP();
   setupPPP();
   setupMQTT();
   setupWeb();
@@ -234,6 +244,7 @@ void setup() {
 }
 
 void loop() {
+  // Service PPP input coming from Serial0 (pppos)
   if (ppp) {
     static uint8_t buf[256];
     int avail = Serial.available();
@@ -245,6 +256,12 @@ void loop() {
       }
     }
   }
+
+  // Service HTTP
   server.handleClient();
+
+  // *** Service MQTT broker (CRUCIAL) ***
+  broker.loop();
+
   yield();
 }
