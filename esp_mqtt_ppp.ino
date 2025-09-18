@@ -2,29 +2,13 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
-#include "TinyMqtt.h"   // https://github.com/hsaturn/TinyMqtt
+#include<sMQTTBroker.h>
 
-const uint16_t PORT = 1883;
-const uint8_t  RETAIN = 10;  // Max retained messages
+#define PORT 1883
 
-MqttBroker broker(PORT); //, RETAIN);
+sMQTTBroker broker;
 
-/** Basic Mqtt Broker
-  *
-  *  +-----------------------------+
-  *  | ESP                         |
-  *  |       +--------+            |
-  *  |       | broker |            | 1883 <--- External client/s
-  *  |       +--------+            |
-  *  |                             |
-  *  +-----------------------------+
-  *
-  *  Your ESP will become a MqttBroker.
-	*  You can test it with any client such as mqtt-spy for example
-	*
-	* Messages are retained *only* if retain > 0
-	*
-  */
+
 
 
 extern "C" {
@@ -201,8 +185,7 @@ void setupPPP() {
 
 // ===== MQTT bring-up (uMQTTBroker) =====
 void setupMQTT() {
-  broker.begin();  // starts broker on :1883, IP_ANY (AP + PPP)
-  //broker.publish("wemos/status", "online", true);
+  broker.init(PORT);
   Serial1.println("[MQTT] MQTTBroker up on :1883 (AP+PPP)");
 }
 
@@ -247,9 +230,7 @@ void loop() {
 
   // Service HTTP
   server.handleClient();
-
-  // uMQTTBroker runs in the background via lwIP callbacks; no loop() call needed.
-  // TinyBroker needs loop
-  broker.loop();
+  // MQTT Broker
+  broker.update();
   yield();
 }
