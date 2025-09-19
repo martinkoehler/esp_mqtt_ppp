@@ -2,14 +2,12 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
-#include<sMQTTBroker.h>
+#include "TinyMqtt.h"   // https://github.com/hsaturn/TinyMqtt
 
 #define PORT 1883
-
-sMQTTBroker broker;
-
-
-
+# define MQTTINTERVAL 10 // milliseconds
+MqttBroker broker(PORT);
+unsigned long lastMQTT = 0;
 
 extern "C" {
   #include "lwip/opt.h"
@@ -129,7 +127,7 @@ void handleRoot() {
   html += "</form>";
 
   html += "<h2>Reset Wemos</h2>";
-  html += "<form method='POST' action='/reset'><input type='submit' value='Reboot'></form>";
+  html += "<form method='POST' action='/reset'><input type='submit' value='Reset & Reboot'></form>";
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -146,6 +144,7 @@ void handleSetAP() {
 }
 
 void handleReset() {
+  saveAPConfig(ap_ssid,ap_pass);
   server.send(200, "text/html", "<html><body><h1>Rebooting...</h1></body></html>");
   delay(500);
   ESP.restart();
@@ -185,7 +184,7 @@ void setupPPP() {
 
 // ===== MQTT bring-up (uMQTTBroker) =====
 void setupMQTT() {
-  broker.init(PORT);
+  broker.begin();  // starts broker
   Serial1.println("[MQTT] MQTTBroker up on :1883 (AP+PPP)");
 }
 
@@ -215,6 +214,7 @@ void setup() {
 }
 
 void loop() {
+  yield();
   // Feed PPP input from UART0 (pppos)
   if (ppp) {
     static uint8_t buf[512];
@@ -230,7 +230,12 @@ void loop() {
 
   // Service HTTP
   server.handleClient();
-  // MQTT Broker
-  broker.update();
+
+  if (millis() - lastMQTT > MQTTINTERVAL) {
+    // TinyBroker needs loop
+    broker.loop();
+    lastMQTT = millis();
+  }
+
   yield();
 }
