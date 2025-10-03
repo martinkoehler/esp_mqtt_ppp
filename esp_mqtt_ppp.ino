@@ -1,40 +1,16 @@
 /**
- * esp_mqtt_ppp_nat_telnet_health_refactored.ino
+ * esp_mqtt_ppp_nat_telnet_health_refactored_weblog.ino
  *
- * ESP8266 (Wemos D1) roles:
- *  - SoftAP with simple web UI (config + client list)
- *  - PPPoS over UART0 (Serial) as WAN uplink
- *  - NAPT (NAT) on PPP interface for AP clients
- *  - Embedded TinyMqtt broker on port 1883
- *  - Telnet mirror for Serial1 logs on 192.168.4.1:2048
- *  - Lightweight health monitor (AP/PPP/NAT/WEB/MQTT) + periodic telemetry
- *  - Boot diagnostics (reset reason, exception registers)
- *
- * Architecture:
- *  - Configuration section (edit here)
- *  - TelnetLogger (wraps Serial1 and mirrors to a single telnet client)
- *  - Netif utilities (find/dump)
- *  - AP bring-up
- *  - PPP bring-up + callbacks
- *  - NAT enabling
- *  - Web UI
- *  - MQTT (time-sliced loop)
- *  - Health monitor (AP/PPP/MQTT/WEB/Telnet + telemetry)
- *  - setup()/loop()
- *
- * NOTES
- *  - PPP uses Serial (UART0) @ 115200.
- *  - Logs use Serial1 (UART1) @ 74880 mirrored to telnet:2048.
- *  - TinyMqtt broker listens on ALL interfaces:1883 (AP + PPP).
- *  - AP credentials are persisted in EEPROM.
+ * Adds:
+ *  - Early boot log capture (first 10s of Serial1) shown on the web UI.
+ *  - Persistent boot diagnostics (reset reason, exception registers) in EEPROM.
+ *  - Telemetry snapshot (heap/frag/AP/PPP + netif dump) on the web UI.
  */
-
-// ============================== Includes ===============================
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
-#include "TinyMqtt.h"   // https://github.com/hsaturn/TinyMqtt
+#include "TinyMqtt.h"
 
 extern "C" {
   #include "lwip/opt.h"
@@ -47,33 +23,31 @@ extern "C" {
   #include "lwip/ip4.h"
   #include "lwip/ip4_addr.h"
   #include "lwip/napt.h"
-  #include "user_interface.h"       // system_get_rst_info, wifi_* helpers
+  #include "user_interface.h"
 }
 
 // ============================== Config =================================
 
-// --- Serial / Telnet
-static const unsigned long LOG_BAUD         = 74880;   // UART1 baud for logs
-static const uint16_t      TELNET_PORT      = 2048;    // telnet log port
-static const unsigned long PPP_BAUD         = 115200;  // UART0 baud (PPP)
+static const unsigned long LOG_BAUD         = 74880;     // UART1 logs
+static const uint16_t      TELNET_PORT      = 2048;      // Telnet logs
+static const unsigned long PPP_BAUD         = 115200;    // PPP UART0
+static const uint32_t      EARLY_LOG_MS     = 10000;     // capture first 10s
 
-// --- AP defaults (can be changed via Web UI and saved to EEPROM)
 static const int           AP_CHANNEL       = 6;
 IPAddress ap_ip(192,168,4,1), ap_gw(192,168,4,1), ap_mask(255,255,255,0);
 
-// --- MQTT
 static const uint16_t      MQTT_PORT        = 1883;
-#define MQTT_BURST_INTERVAL_MS   2          // broker loop slice period
-#define MQTT_BURST_BUDGET_US     1200       // per-slice budget in µs
+#define MQTT_BURST_INTERVAL_MS   2
+#define MQTT_BURST_BUDGET_US     1200
 
-// --- EEPROM layout for AP SSID/PASS
-#define EEPROM_SIZE 128
+// EEPROM layout
+#define EEPROM_SIZE 256            // bumped to hold diag struct
 #define SSID_ADDR   0
 #define PASS_ADDR   32
+#define DIAG_ADDR   96             // leave room; align to 32B boundary
 #define MAX_SSID    31
 #define MAX_PASS    31
 
-// --- NAT table sizes
 #ifndef IP_NAPT_MAX
 #define IP_NAPT_MAX     512
 #endif
@@ -81,37 +55,58 @@ static const uint16_t      MQTT_PORT        = 1883;
 #define IP_PORTMAP_MAX  32
 #endif
 
-// --- Health monitor cadence
-static const uint32_t HEALTH_EVERY_MS     = 3000;   // health run period
-static const uint32_t TELEMETRY_EVERY_MS  = 30000;  // telemetry period
+static const uint32_t HEALTH_EVERY_MS     = 3000;
+static const uint32_t TELEMETRY_EVERY_MS  = 30000;
 
 // ============================== Globals ================================
 
-// AP credentials (persisted)
 char ap_ssid[MAX_SSID+1] = "WemosD1";
 char ap_pass[MAX_PASS+1] = "0187297154091575";
 
-// NAT
 static bool napt_inited = false;
 
-// MQTT broker
 MqttBroker broker(MQTT_PORT);
 static unsigned long lastMQTTBurst = 0;
-static unsigned long lastMQTTLoopTouchMs = 0; // liveness marker
+static unsigned long lastMQTTLoopTouchMs = 0;
 static bool mqttEverBegan = false;
 
-// Web server
 ESP8266WebServer server(80);
 static bool webEverBegan = false;
 
-// PPP state
 static ppp_pcb *ppp = nullptr;
-static struct netif ppp_netif;   // pppos_create fills this
+static struct netif ppp_netif;
 
-// Health monitor
 static unsigned long lastHealthTickMs = 0;
 static unsigned long lastTelemetryMs = 0;
-static uint32_t      healthRuns = 0;
+
+// Web-visible telemetry snapshot
+static String g_lastTelLine;
+static String g_lastNetifDump;
+
+// ======================= Persistent Boot Diagnostics ===================
+
+struct BootDiag {
+  uint32_t magic;       // 0xB00DDA7A
+  uint32_t reason;
+  uint32_t exccause;
+  uint32_t epc1, epc2, epc3, excvaddr, depc;
+  uint32_t flashKB, cpuMHz, sketchKB, freeSketchKB;
+  uint32_t bootCount;
+};
+
+static const uint32_t BOOTDIAG_MAGIC = 0xB00DDA7A;
+static BootDiag g_bootdiag = {};
+
+void loadBootDiag() {
+  BootDiag tmp = {};
+  EEPROM.get(DIAG_ADDR, tmp);
+  if (tmp.magic == BOOTDIAG_MAGIC) g_bootdiag = tmp;
+}
+
+void saveBootDiag() {
+  EEPROM.put(DIAG_ADDR, g_bootdiag);
+  EEPROM.commit();
+}
 
 // ============================= Telnet Logger ===========================
 
@@ -119,11 +114,11 @@ static uint32_t      healthRuns = 0;
 #include <WiFiServer.h>
 
 /**
- * TelnetLogger
- *  - Presents a Print-compatible interface that mirrors writes to:
- *      - UART1 (hardware Serial1)
- *      - A single telnet client on 192.168.4.1:TELNET_PORT
- *  - Start with begin(baud), call loop() frequently (cheap).
+ * TelnetLogger:
+ *  - Mirrors writes to UART1 and a single Telnet client (port TELNET_PORT).
+ *  - Captures the first EARLY_LOG_MS of output (RAM ring) for the web UI.
+ *  - Maintains an always-on 8KB rolling buffer for HTTP live tail (/logs).
+ *  - Provides incremental tailing via a monotonic byte sequence counter.
  */
 class TelnetLogger : public Print {
 public:
@@ -131,7 +126,8 @@ public:
 
   void begin(unsigned long baud) {
     ::Serial1.begin(baud);
-    _wantServer = true;               // start server once AP is up
+    _wantServer = true;
+    _captureUntil = millis() + EARLY_LOG_MS;   // early-capture window
   }
 
   void loop() {
@@ -149,25 +145,106 @@ public:
       _client.println("ESP8266 Serial1 log (Telnet). Close client to detach.");
     }
     // Cleanup dead client
-    if (_client && !_client.connected()) {
-      _client.stop();
-    }
+    if (_client && !_client.connected()) _client.stop();
   }
 
-  // Print proxy: mirror a byte/buffer to UART1 and telnet client
+  // ---- Print proxy: write to UART1 + Telnet + capture buffers ----
   size_t write(uint8_t b) override {
     ::Serial1.write(b);
     if (_client && _client.connected()) _client.write(&b, 1);
+    captureEarly(&b, 1);
+    captureRolling(&b, 1);
     return 1;
   }
   size_t write(const uint8_t* buf, size_t size) override {
     ::Serial1.write(buf, size);
     if (_client && _client.connected()) _client.write(buf, size);
+    captureEarly(buf, size);
+    captureRolling(buf, size);
     return size;
   }
   using Print::write;
 
+  // ---- Early boot capture (first 10s) ----
+  void getEarlyLog(String& out) const {
+    out.reserve(_capCount + 64);
+    if (_capCount == 0) return;
+    size_t i = _capStart;
+    for (size_t n = 0; n < _capCount; ++n) {
+      out += (char)_capBuf[i];
+      if (++i == CAP_SIZE) i = 0;
+    }
+  }
+
+  // ---- Rolling log tail API (for /logs) ----
+  // Get current monotonic sequence (bytes written so far)
+  uint32_t logSeq() const { return _logTotal; }
+
+  // Append bytes since 'sinceSeq' to 'out', update 'nextSeq' to new tail.
+  // If caller is too far behind (>LOG_SIZE), it will receive only the last LOG_SIZE bytes.
+  void copySince(uint32_t sinceSeq, String& out, uint32_t& nextSeq, size_t maxChunk = 1024) const {
+    // How many new bytes exist in total
+    uint32_t total = _logTotal;
+    int32_t delta = (int32_t)(total - sinceSeq);
+    if (delta <= 0) { nextSeq = total; return; } // nothing new
+
+    size_t avail = (size_t)delta;
+    if (avail > LOG_SIZE) {        // too far behind; only last LOG_SIZE available
+      avail = LOG_SIZE;
+      sinceSeq = total - avail;
+    }
+
+    // Starting index of oldest available byte we will send
+    size_t startIndex = (_logWrite + LOG_SIZE - avail) % LOG_SIZE;
+
+    // Limit how much we copy per call (keeps handler snappy)
+    if (avail > maxChunk) avail = maxChunk;
+
+    out.reserve(out.length() + avail);
+    size_t i = startIndex;
+    for (size_t n = 0; n < avail; ++n) {
+      out += (char)_logBuf[i];
+      if (++i == LOG_SIZE) i = 0;
+    }
+
+    nextSeq = sinceSeq + avail;
+  }
+
 private:
+  // ---- Early-capture ring buffer (first N seconds) ----
+  static constexpr size_t CAP_SIZE = 4096;
+  uint8_t  _capBuf[CAP_SIZE];
+  size_t   _capStart = 0;
+  size_t   _capCount = 0;
+  unsigned long _captureUntil = 0;
+
+  void captureEarly(const uint8_t* buf, size_t len) {
+    if ((int32_t)(millis() - _captureUntil) > 0) return; // window ended
+    for (size_t i = 0; i < len; ++i) {
+      if (_capCount < CAP_SIZE) {
+        _capBuf[_capCount++] = buf[i];
+      } else {
+        _capBuf[_capStart] = buf[i];
+        _capStart = (_capStart + 1) % CAP_SIZE;
+      }
+    }
+  }
+
+  // ---- Rolling log ring buffer (always on) ----
+  static constexpr size_t LOG_SIZE = 8192;
+  uint8_t  _logBuf[LOG_SIZE];
+  size_t   _logWrite = 0;     // next write position
+  uint32_t _logTotal = 0;     // total bytes ever written (monotonic)
+
+  void captureRolling(const uint8_t* buf, size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+      _logBuf[_logWrite] = buf[i];
+      _logWrite = (_logWrite + 1) % LOG_SIZE;
+      _logTotal++;
+    }
+  }
+
+  // ---- Telnet server ----
   WiFiServer _server;
   WiFiClient _client;
   bool _serverStarted = false;
@@ -180,40 +257,40 @@ TelnetLogger TelnetSerial1(TELNET_PORT);
 
 // ============================= Netif Utils =============================
 
-/** Dump all netifs: #num, name, IPv4, GW, MASK, flags */
-void dump_netifs(const char* tag) {
-  Serial1.printf("[NETIF] %s\n", tag);
+void dump_netifs_to(String& out, const char* tag) {
+  out += "[NETIF] ";
+  out += tag;
+  out += "\n";
   for (netif* n = netif_list; n; n = n->next) {
     ip4_addr_t ip = *netif_ip4_addr(n);
     ip4_addr_t gw = *netif_ip4_gw(n);
     ip4_addr_t mk = *netif_ip4_netmask(n);
-    Serial1.printf("  #%u %c%c  ip=%s gw=%s mask=%s flags=0x%02x\n",
-                   n->num, n->name[0], n->name[1],
-                   ipaddr_ntoa(&ip), ipaddr_ntoa(&gw), ipaddr_ntoa(&mk),
-                   n->flags);
+    char line[160];
+    snprintf(line, sizeof(line), "  #%u %c%c  ip=%s gw=%s mask=%s flags=0x%02x\n",
+             n->num, n->name[0], n->name[1],
+             ipaddr_ntoa(&ip), ipaddr_ntoa(&gw), ipaddr_ntoa(&mk),
+             n->flags);
+    out += line;
   }
 }
 
-/** Find the PPP netif (lwIP name "pp") */
-netif* findPPP() {
-  for (netif* n = netif_list; n; n = n->next) {
-    if (n->name[0] == 'p' && n->name[1] == 'p') return n;
-  }
-  return nullptr;
+void dump_netifs(const char* tag) {
+  String tmp;
+  dump_netifs_to(tmp, tag);
+  Serial1.print(tmp);
 }
 
 // ============================== AP Bring-up ============================
 
-/** Load persisted AP SSID/PASS from EEPROM (or defaults if blank) */
 void loadAPConfig() {
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.get(SSID_ADDR, ap_ssid);
   EEPROM.get(PASS_ADDR, ap_pass);
   if (ap_ssid[0] == 0xFF || ap_ssid[0] == '\0') strcpy(ap_ssid, "WemosD1");
   if (ap_pass[0] == 0xFF || ap_pass[0] == '\0') strcpy(ap_pass, "0187297154091575");
+  loadBootDiag(); // also load persisted boot diagnostics
 }
 
-/** Persist AP SSID/PASS to EEPROM */
 void saveAPConfig(const char* ssid, const char* pass) {
   memset(ap_ssid, 0, sizeof(ap_ssid));
   memset(ap_pass, 0, sizeof(ap_pass));
@@ -224,7 +301,6 @@ void saveAPConfig(const char* ssid, const char* pass) {
   EEPROM.commit();
 }
 
-/** Configure and start SoftAP (idempotent) */
 void setupAP() {
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(ap_ip, ap_gw, ap_mask);
@@ -234,19 +310,16 @@ void setupAP() {
     Serial1.printf("[AP] %s up at %s\n",
                    ap_ssid, WiFi.softAPIP().toString().c_str());
   }
-  // Keep Wi-Fi awake for responsiveness
   wifi_set_sleep_type(NONE_SLEEP_T);
   dump_netifs("after softAP");
 }
 
 // ========================= PPP / NAT Bring-up =========================
 
-/** PPP lower-layer output: write to UART0 (Serial) */
 static u32_t ppp_output_cb(ppp_pcb *, u8_t *data, u32_t len, void *) {
   return Serial.write(data, len); // PPP link = Serial (UART0)
 }
 
-/** Enable NAPT on the PPP netif (safe to re-assert) */
 static void enable_nat_on_ppp_if_available() {
   netif* n = findPPP();
   if (!n) {
@@ -265,7 +338,6 @@ static void enable_nat_on_ppp_if_available() {
   }
 }
 
-/** PPP status callback: log, enable NAT, reconnect on error */
 static void ppp_status_cb(ppp_pcb *, int err_code, void *) {
   if (err_code == PPPERR_NONE) {
     const ip_addr_t* ip = netif_ip_addr4(&ppp_netif);
@@ -282,9 +354,8 @@ static void ppp_status_cb(ppp_pcb *, int err_code, void *) {
   }
 }
 
-/** Create/connect PPPoS on Serial (default route) */
 void setupPPP() {
-  Serial.begin(PPP_BAUD);   // PPP link over UART0
+  Serial.begin(PPP_BAUD);
   delay(50);
 
   ppp = pppos_create(&ppp_netif, ppp_output_cb, ppp_status_cb, nullptr);
@@ -295,43 +366,89 @@ void setupPPP() {
 #if defined(PPPAUTHTYPE_NONE)
   ppp_set_auth(ppp, PPPAUTHTYPE_NONE, "", "");
 #endif
-  ppp_set_default(ppp);   // make PPP the default route
+  ppp_set_default(ppp);
   ppp_connect(ppp, 0);
   Serial1.println("[PPP] connecting...");
 }
 
 // ================================ Web UI ==============================
 
-/** Simple status/config page */
 void handleRoot() {
-  String html = "<html><head><title>Wemos AP/PPP NAT</title></head><body>";
-  html += "<h1>Wemos AP/PPP NAT</h1>";
-  html += "<p>AP SSID: " + String(ap_ssid) + "</p>";
+  String html;
+  html.reserve(8192);
+  html += F("<html><head><title>Wemos AP/PPP NAT</title>"
+            "<style>body{font-family:ui-monospace,monospace;}"
+            "pre{background:#111;color:#eee;padding:8px;white-space:pre-wrap;word-break:break-word;}"
+            "h1,h2{font-family:sans-serif}</style></head><body>");
+  html += F("<h1>Wemos AP/PPP NAT</h1>");
+  html += F("<p>AP SSID: ");
+  html += ap_ssid;
+  html += F("</p>");
 
-  html += "<h2>Connected AP Clients</h2><ul>";
+  // Connected clients
+  html += F("<h2>Connected AP Clients</h2><ul>");
   struct station_info *stat_info = wifi_softap_get_station_info();
   while (stat_info) {
     IPAddress ip = IPAddress(stat_info->ip.addr);
-    html += "<li>" + ip.toString() + "</li>";
+    html += F("<li>");
+    html += ip.toString();
+    html += F("</li>");
     stat_info = STAILQ_NEXT(stat_info, next);
   }
   wifi_softap_free_station_info();
-  html += "</ul>";
+  html += F("</ul>");
+  html += F("<p><a href='/logs.html'>Open Live Logs</a></p>");
 
-  html += "<h2>Set AP Parameters</h2>";
-  html += "<form method='POST' action='/setap'>";
-  html += "SSID: <input name='ssid' value='" + String(ap_ssid) + "'><br>";
-  html += "Password: <input name='pass' value='" + String(ap_pass) + "'><br>";
-  html += "<input type='submit' value='Save & Reboot'>";
-  html += "</form>";
+  // Boot diagnostics (persisted)
+  html += F("<h2>Boot Diagnostics (persisted)</h2><pre>");
+  html += "BootCount: "; html += String(g_bootdiag.bootCount); html += "\n";
+  html += "Reason   : "; html += String(g_bootdiag.reason); html += "\n";
+  html += "exccause : "; html += String(g_bootdiag.exccause); html += "\n";
+  html += "epc1     : 0x"; html += String(g_bootdiag.epc1, HEX); html += "\n";
+  html += "epc2     : 0x"; html += String(g_bootdiag.epc2, HEX); html += "\n";
+  html += "epc3     : 0x"; html += String(g_bootdiag.epc3, HEX); html += "\n";
+  html += "excvaddr : 0x"; html += String(g_bootdiag.excvaddr, HEX); html += "\n";
+  html += "depc     : 0x"; html += String(g_bootdiag.depc, HEX); html += "\n";
+  html += "CPU MHz  : "; html += String(g_bootdiag.cpuMHz); html += "\n";
+  html += "Flash KB : "; html += String(g_bootdiag.flashKB); html += "\n";
+  html += "Sketch KB: "; html += String(g_bootdiag.sketchKB); html += "\n";
+  html += "FreeSK KB: "; html += String(g_bootdiag.freeSketchKB); html += "\n";
+  html += F("</pre>");
 
-  html += "<h2>Reset</h2>";
-  html += "<form method='POST' action='/reset'><input type='submit' value='Reboot'></form>";
-  html += "</body></html>";
+  // Early boot log (first 10s of Serial1)
+  html += F("<h2>Early Boot Log (first 10s of Serial1)</h2><pre>");
+  {
+    String cap;
+    Serial1.getEarlyLog(cap);
+    if (cap.length() == 0) html += F("(no capture or window elapsed)");
+    else html += cap;
+  }
+  html += F("</pre>");
+
+  // Telemetry snapshot
+  html += F("<h2>Telemetry Snapshot</h2><pre>");
+  html += g_lastTelLine;
+  html += F("\n");
+  html += g_lastNetifDump;
+  html += F("</pre>");
+
+  // Config form
+  html += F("<h2>Set AP Parameters</h2>"
+            "<form method='POST' action='/setap'>"
+            "SSID: <input name='ssid' value='");
+  html += ap_ssid;
+  html += F("'><br>Password: <input name='pass' value='");
+  html += ap_pass;
+  html += F("'><br><input type='submit' value='Save & Reboot'></form>");
+
+  // Reset
+  html += F("<h2>Reset</h2>"
+            "<form method='POST' action='/reset'><input type='submit' value='Reboot'></form>");
+
+  html += F("</body></html>");
   server.send(200, "text/html", html);
 }
 
-/** Save AP config and reboot */
 void handleSetAP() {
   if (server.hasArg("ssid") && server.hasArg("pass")) {
     saveAPConfig(server.arg("ssid").c_str(), server.arg("pass").c_str());
@@ -343,19 +460,114 @@ void handleSetAP() {
   }
 }
 
-/** Manual reboot */
 void handleReset() {
-  saveAPConfig(ap_ssid, ap_pass); // persist current values (no-op if unchanged)
+  saveAPConfig(ap_ssid, ap_pass);
   server.send(200, "text/html", "<html><body><h1>Rebooting...</h1></body></html>");
   delay(500);
   ESP.restart();
 }
 
-/** Bind routes and start HTTP server */
 void setupWeb() {
   server.on("/", handleRoot);
   server.on("/setap", HTTP_POST, handleSetAP);
   server.on("/reset", HTTP_POST, handleReset);
+    // --- Live log tail over HTTP (chunked/plaintext) ---
+  server.on("/logs", []() {
+    // Prepare chunked response
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.sendHeader("Cache-Control", "no-cache");
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/plain", "");
+
+    // Tail from current end (client sees only "new" logs)
+    WiFiClient client = server.client();
+    uint32_t seq = Serial1.logSeq();
+    const unsigned long t0 = millis();
+    const unsigned long MAX_MS = 20000;  // ~20s per request
+
+    // Small greeting (so something appears immediately)
+    server.sendContent("=== /logs live tail (20s window) ===\n");
+
+    while (client.connected() && (uint32_t)(millis() - t0) < MAX_MS) {
+      // Pull up to ~1KB new data this iteration
+      String chunk;
+      uint32_t nextSeq = seq;
+      Serial1.copySince(seq, chunk, nextSeq, 1024);
+
+      if (chunk.length() > 0) {
+        server.sendContent(chunk);
+        seq = nextSeq;
+      }
+
+      // Keep the device responsive; do not block long
+      // (NO server.handleClient() here to avoid re-entrancy)
+      delay(120);
+      yield();
+    }
+    // Final newline and terminate chunked response
+    server.sendContent("\n=== /logs end ===\n");
+    // No need to call server.client().stop() explicitly; framework will close.
+  });
+    // --- Live log viewer page with auto-reconnect & autoscroll ---
+  server.on("/logs.html", []() {
+    String html;
+    html.reserve(6000);
+    html += F(
+      "<!doctype html><html><head><meta charset='utf-8'/>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+      "<title>ESP8266 Live Logs</title>"
+      "<style>"
+      "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;margin:0;background:#0b0b0b;color:#eaeaea}"
+      "header{padding:10px 14px;background:#111;position:sticky;top:0;z-index:1;border-bottom:1px solid #222}"
+      "button, input[type=checkbox]{font:inherit}"
+      "#log{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;"
+      " background:#0b0b0b;padding:12px;margin:0;min-height:calc(100vh - 58px)}"
+      ".row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}"
+      ".pill{padding:4px 8px;background:#1c1c1c;border:1px solid #2b2b2b;border-radius:999px}"
+      "</style></head><body>"
+      "<header class='row'>"
+        "<div class='pill'>/logs live tail</div>"
+        "<button id='btn' onclick='toggle()'>Stop</button>"
+        "<label><input id='auto' type='checkbox' checked/> Auto-scroll</label>"
+        "<span id='status' class='pill'>connecting…</span>"
+      "</header>"
+      "<pre id='log'></pre>"
+      "<script>"
+      "let running=true, seq='now', ctrl=null, auto=true;"
+      "const logEl=document.getElementById('log');"
+      "const btn=document.getElementById('btn');"
+      "const st=document.getElementById('status');"
+      "const autoCb=document.getElementById('auto');"
+      "autoCb.addEventListener('change',e=>auto=e.target.checked);"
+      "function toggle(){running=!running;btn.textContent=running?'Stop':'Start';if(running) start(); else if(ctrl){ctrl.abort();ctrl=null;st.textContent='stopped';}}"
+      "function append(t){logEl.textContent+=t; if(auto) logEl.scrollTop=logEl.scrollHeight;}"
+      "async function start(){"
+        "try{"
+          "st.textContent='connecting…';"
+          "ctrl=new AbortController();"
+          // Start at current end; if you prefer some history, change '?since=current' to a numeric seq
+          "const resp=await fetch('/logs',{signal:ctrl.signal});"
+          "if(!resp.body){append('\\n(streaming not supported by this browser)\\n');return;}"
+          "st.textContent='streaming';"
+          "const reader=resp.body.getReader();"
+          "const dec=new TextDecoder();"
+          "for(;;){"
+            "const {value,done}=await reader.read();"
+            "if(done) break;"
+            "append(dec.decode(value));"
+          "}"
+          "st.textContent='reconnecting…';"
+          "setTimeout(()=>{ if(running) start(); }, 500);"
+        "}catch(e){"
+          "st.textContent='error: '+(e&&e.message?e.message:e);"
+          "setTimeout(()=>{ if(running) start(); }, 1000);"
+        "}"
+      "}"
+      "window.addEventListener('load', start);"
+      "</script></body></html>"
+    );
+    server.send(200, "text/html", html);
+  });
   server.begin();
   webEverBegan = true;
   Serial1.println("[WEB] HTTP server started on port 80");
@@ -363,23 +575,21 @@ void setupWeb() {
 
 // ================================ MQTT ================================
 
-/** Time-sliced broker loop to keep Wi-Fi/PPP latency low */
 static inline void serviceMQTT_timesliced() {
   const unsigned long now = millis();
   if ((uint32_t)(now - lastMQTTBurst) >= MQTT_BURST_INTERVAL_MS) {
     const uint32_t deadline = micros() + MQTT_BURST_BUDGET_US;
     do {
       broker.loopWithBudget(MQTT_BURST_BUDGET_US);
-      yield();                           // feed Wi-Fi/WDT
+      yield();
     } while ((int32_t)(deadline - micros()) > 0);
     lastMQTTBurst = now;
-    lastMQTTLoopTouchMs = now;           // liveness marker
+    lastMQTTLoopTouchMs = now;
   }
 }
 
-/** Start MQTT broker on all interfaces */
 void setupMQTT() {
-  broker.begin();  // IP_ANY:MQTT_PORT
+  broker.begin();
   mqttEverBegan = true;
   lastMQTTLoopTouchMs = millis();
   Serial1.printf("[MQTT] TinyMqtt broker on :%u (AP+PPP)\n", MQTT_PORT);
@@ -387,7 +597,6 @@ void setupMQTT() {
 
 // ============================= Health Monitor =========================
 
-/** Human-readable reset reason text */
 const char* rstReasonToStr(uint32_t r) {
   switch (r) {
     case 0:  return "REASON_DEFAULT_RST";
@@ -401,7 +610,13 @@ const char* rstReasonToStr(uint32_t r) {
   }
 }
 
-/** (Re)assert AP if needed; also re-init if IP went 0.0.0.0 */
+netif* findPPP() {
+  for (netif* n = netif_list; n; n = n->next) {
+    if (n->name[0] == 'p' && n->name[1] == 'p') return n;
+  }
+  return nullptr;
+}
+
 static void ensureAPUp() {
   const bool apMode = (WiFi.getMode() & WIFI_AP);
   if (!apMode) {
@@ -415,7 +630,6 @@ static void ensureAPUp() {
   }
 }
 
-/** Ensure PPP is present/up; reconnect or recreate as needed; pin NAT */
 static void ensurePPPUp() {
   netif* n = findPPP();
   if (!ppp) {
@@ -433,11 +647,9 @@ static void ensurePPPUp() {
     ppp_connect(ppp, 0);
     return;
   }
-  // Keep NAT pinned to PPP (idempotent)
   enable_nat_on_ppp_if_available();
 }
 
-/** Restart MQTT if its loop hasn't been serviced for >10s (heuristic) */
 static void ensureMQTTUp() {
   if (!mqttEverBegan) return;
   const unsigned long now = millis();
@@ -448,22 +660,20 @@ static void ensureMQTTUp() {
   }
 }
 
-/** Web server: idempotent re-assert begin every N health cycles */
 static void ensureWebUp() {
+  return;
   if (!webEverBegan) return;
   static uint8_t counter = 0;
-  if ((++counter % 10) == 0) {     // ~ every 30s at default cadence
+  if ((++counter % 10) == 0) {
     Serial1.println("[HEALTH][WEB] re-assert server.begin()");
     server.begin();
   }
 }
 
-/** Telnet server/client upkeep (cheap) */
 static void ensureTelnetUp() {
   Serial1.loop();
 }
 
-/** Periodic telemetry: heap, fragmentation, AP/PPP state, netifs. */
 static void logTelemetry() {
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t maxBlk   = ESP.getMaxFreeBlockSize();
@@ -474,25 +684,33 @@ static void logTelemetry() {
   const char* pppState = (p && netif_is_up(p)) ? "UP" : "DOWN";
   const char* apState  = (WiFi.getMode() & WIFI_AP) ? "UP" : "DOWN";
 
-  Serial1.printf("[TEL] up=%lus heap=%lu maxblk=%lu frag=%u%% AP=%s STA=%d PPP=%s IP=%s\n",
-    millis()/1000UL,
-    (unsigned long)freeHeap,
-    (unsigned long)maxBlk,
-    (unsigned)frag,
-    apState,
-    staCount,
-    pppState,
-    p ? ipaddr_ntoa(netif_ip4_addr(p)) : "0.0.0.0"
-  );
-  dump_netifs("periodic");
+  char line[200];
+  snprintf(line, sizeof(line),
+           "[TEL] up=%lus heap=%lu maxblk=%lu frag=%u%% AP=%s STA=%d PPP=%s IP=%s",
+           millis()/1000UL,
+           (unsigned long)freeHeap,
+           (unsigned long)maxBlk,
+           (unsigned)frag,
+           apState,
+           staCount,
+           pppState,
+           p ? ipaddr_ntoa(netif_ip4_addr(p)) : "0.0.0.0");
+
+  g_lastTelLine = line;
+
+  String netifs;
+  dump_netifs_to(netifs, "periodic");
+  g_lastNetifDump = netifs;
+
+  // Also print to logs
+  Serial1.println(g_lastTelLine);
+  Serial1.print(g_lastNetifDump);
 }
 
-/** Run all health checks on a fixed cadence (non-blocking) */
 static void serviceHealth() {
   const unsigned long now = millis();
   if ((uint32_t)(now - lastHealthTickMs) < HEALTH_EVERY_MS) return;
   lastHealthTickMs = now;
-  healthRuns++;
 
   ensureAPUp();
   ensurePPPUp();
@@ -508,7 +726,6 @@ static void serviceHealth() {
 
 // ============================ Service Loops ============================
 
-/** Feed PPP input from Serial (UART0) into lwIP PPPoS */
 static inline void servicePPP() {
   if (!ppp) return;
   static uint8_t buf[512];
@@ -517,57 +734,69 @@ static inline void servicePPP() {
     int n = Serial.readBytes(buf, (avail > (int)sizeof(buf)) ? sizeof(buf) : avail);
     if (n > 0) {
       pppos_input(ppp, buf, n);
-      if (avail > 128) delay(0); // relieve WDT on big bursts
+      if (avail > 128) delay(0);
     }
   }
 }
 
-/** Handle Web requests (cheap if no client) */
-static inline void serviceHTTP() {
-  server.handleClient();
-}
+static inline void serviceHTTP() { server.handleClient(); }
 
 // ============================== Arduino ================================
 
 void setup() {
-  // Start logging (mirrored to telnet)
   Serial1.begin(LOG_BAUD);
   delay(100);
 
-  // Defensive Wi-Fi settings
-  WiFi.persistent(false);             // reduce flash wear
-  wifi_set_sleep_type(NONE_SLEEP_T);  // keep Wi-Fi responsive
+  WiFi.persistent(false);
+  wifi_set_sleep_type(NONE_SLEEP_T);
 
-  // Load AP config and bring everything up
-  loadAPConfig();
+  loadAPConfig(); // also loads persisted boot diag
+
+  // Update persisted boot diagnostics for THIS boot and save once
+  struct rst_info* ri = system_get_rst_info();
+  g_bootdiag.magic       = BOOTDIAG_MAGIC;
+  g_bootdiag.bootCount   = g_bootdiag.bootCount + 1;
+  g_bootdiag.reason      = ri->reason;
+  g_bootdiag.exccause    = ri->exccause;
+  g_bootdiag.epc1        = ri->epc1;
+  g_bootdiag.epc2        = ri->epc2;
+  g_bootdiag.epc3        = ri->epc3;
+  g_bootdiag.excvaddr    = ri->excvaddr;
+  g_bootdiag.depc        = ri->depc;
+  g_bootdiag.cpuMHz      = ESP.getCpuFreqMHz();
+  g_bootdiag.flashKB     = ESP.getFlashChipSize()/1024;
+  g_bootdiag.sketchKB    = ESP.getSketchSize()/1024;
+  g_bootdiag.freeSketchKB= ESP.getFreeSketchSpace()/1024;
+  saveBootDiag();  // single EEPROM write per boot
+
+  // Bring up services
   setupAP();
   setupPPP();
   setupMQTT();
   setupWeb();
 
-  // Boot diagnostics: reset reason + exception registers if relevant
-  struct rst_info* ri = system_get_rst_info();
-  Serial1.printf("[BOOT] ResetReason=%s (%u)\n", rstReasonToStr(ri->reason), ri->reason);
+  // Also log boot diag to Serial1 (gets captured during early window)
+  Serial1.printf("[BOOT] Reason=%s (%u)\n", rstReasonToStr(ri->reason), ri->reason);
   if (ri->reason == REASON_EXCEPTION_RST || ri->reason == REASON_WDT_RST || ri->reason == REASON_SOFT_WDT_RST) {
     Serial1.printf("[BOOT] exccause=%u epc1=%08x epc2=%08x epc3=%08x excvaddr=%08x depc=%08x\n",
                    ri->exccause, ri->epc1, ri->epc2, ri->epc3, ri->excvaddr, ri->depc);
   }
-  Serial1.printf("[BOOT] SDK:%s CPU:%uMHz Flash:%uKB Sketch:%uKB FreeSketch:%uKB\n",
+  Serial1.printf("[BOOT] SDK:%s CPU:%uMHz Flash:%uKB Sketch:%uKB FreeSketch:%uKB BootCount:%u\n",
                  system_get_sdk_version(), ESP.getCpuFreqMHz(),
-                 ESP.getFlashChipSize()/1024, ESP.getSketchSize()/1024, ESP.getFreeSketchSpace()/1024);
+                 ESP.getFlashChipSize()/1024, ESP.getSketchSize()/1024, ESP.getFreeSketchSpace()/1024,
+                 g_bootdiag.bootCount);
 
-  // Initialize scheduling anchors
-  lastMQTTBurst     = millis();
-  lastMQTTLoopTouchMs = lastMQTTBurst;
-  lastHealthTickMs  = lastMQTTBurst;
-  lastTelemetryMs   = lastMQTTBurst;
+  lastMQTTBurst      = millis();
+  lastMQTTLoopTouchMs= lastMQTTBurst;
+  lastHealthTickMs   = lastMQTTBurst;
+  lastTelemetryMs    = lastMQTTBurst;
 }
 
 void loop() {
-  servicePPP();               // feed PPPoS
-  serviceHTTP();              // serve HTTP
-  serviceMQTT_timesliced();   // time-sliced MQTT broker
-  Serial1.loop();             // telnet upkeep (cheap)
-  serviceHealth();            // AP/PPP/NAT/WEB/MQTT checks + telemetry
-  yield();                    // feed Wi-Fi/WDT
+  servicePPP();
+  serviceHTTP();
+  serviceMQTT_timesliced();
+  Serial1.loop();
+  serviceHealth();
+  yield();
 }
