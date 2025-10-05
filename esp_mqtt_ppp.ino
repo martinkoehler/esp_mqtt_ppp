@@ -127,73 +127,164 @@ void saveBootDiag() { EEPROM.put(DIAG_ADDR, g_bootdiag); EEPROM.commit(); }
  *  - Mirrors writes to UART1 and a single Telnet client (port TELNET_PORT).
  *  - Captures the first EARLY_LOG_MS of output (RAM ring) for the web UI.
  *  - Maintains an always-on 8KB rolling buffer for HTTP live tail (/logs).
+ *  - On Telnet connect: prints persisted Boot Diagnostics + Early Boot Log.
  */
 class TelnetLogger : public Print {
 public:
   TelnetLogger(uint16_t port) : _server(port) {}
+
   void begin(unsigned long baud) {
     ::Serial1.begin(baud);
     _wantServer = true;
     _captureUntil = millis() + EARLY_LOG_MS;   // early-capture window
   }
+
   void loop() {
+    // Lazy-start server when AP exists
     if (_wantServer && !_serverStarted && (WiFi.getMode() & WIFI_AP)) {
-      _server.begin(); _server.setNoDelay(true); _serverStarted = true;
+      _server.begin();
+      _server.setNoDelay(true);
+      _serverStarted = true;
     }
+    // Accept/rotate single client
     if (_serverStarted && _server.hasClient()) {
       if (_client && _client.connected()) _client.stop();
-      _client = _server.available(); _client.setNoDelay(true);
+      _client = _server.available();
+      _client.setNoDelay(true);
+
+      // Greeting
       _client.println("ESP8266 Serial1 log (Telnet). Close client to detach.");
+      _client.println();
+
+      // --- Show persisted Boot Diagnostics immediately ---
+      // (uses globals from the BootDiag block defined earlier in the file)
+      _client.println("=== Boot Diagnostics (persisted) ===");
+      _client.print("BootCount: "); _client.println((unsigned long)g_bootdiag.bootCount);
+      _client.print("Reason   : "); _client.println((unsigned long)g_bootdiag.reason);
+      _client.print("exccause : "); _client.println((unsigned long)g_bootdiag.exccause);
+      _client.print("epc1     : 0x"); _client.println((unsigned long)g_bootdiag.epc1, HEX);
+      _client.print("epc2     : 0x"); _client.println((unsigned long)g_bootdiag.epc2, HEX);
+      _client.print("epc3     : 0x"); _client.println((unsigned long)g_bootdiag.epc3, HEX);
+      _client.print("excvaddr : 0x"); _client.println((unsigned long)g_bootdiag.excvaddr, HEX);
+      _client.print("depc     : 0x"); _client.println((unsigned long)g_bootdiag.depc, HEX);
+      _client.print("CPU MHz  : "); _client.println((unsigned long)g_bootdiag.cpuMHz);
+      _client.print("Flash KB : "); _client.println((unsigned long)g_bootdiag.flashKB);
+      _client.print("Sketch KB: "); _client.println((unsigned long)g_bootdiag.sketchKB);
+      _client.print("FreeSK KB: "); _client.println((unsigned long)g_bootdiag.freeSketchKB);
+      _client.println();
+
+      // --- Show Early Boot Log (first 10s), if any ---
+      String cap;
+      getEarlyLog(cap);
+      if (cap.length() > 0) {
+        _client.println("=== Early Boot Log (first 10s) ===");
+        _client.print(cap);
+        _client.println("\n=== End Early Boot Log ===");
+      } else {
+        _client.println("(no early boot log captured)");
+      }
+      _client.println();
     }
-    if (_client && !_client.connected()) _client.stop();
+
+    // Cleanup dead client
+    if (_client && !_client.connected()) {
+      _client.stop();
+    }
   }
+
+  // ---- Print proxy: write to UART1 + Telnet + capture buffers ----
   size_t write(uint8_t b) override {
-    ::Serial1.write(b); if (_client && _client.connected()) _client.write(&b,1);
-    captureEarly(&b,1); captureRolling(&b,1); return 1;
+    ::Serial1.write(b);
+    if (_client && _client.connected()) _client.write(&b, 1);
+    captureEarly(&b, 1);
+    captureRolling(&b, 1);
+    return 1;
   }
   size_t write(const uint8_t* buf, size_t size) override {
-    ::Serial1.write(buf,size); if (_client && _client.connected()) _client.write(buf,size);
-    captureEarly(buf,size); captureRolling(buf,size); return size;
+    ::Serial1.write(buf, size);
+    if (_client && _client.connected()) _client.write(buf, size);
+    captureEarly(buf, size);
+    captureRolling(buf, size);
+    return size;
   }
   using Print::write;
 
+  // Early boot capture (first N ms)
   void getEarlyLog(String& out) const {
-    out.reserve(_capCount + 64); if (_capCount==0) return;
-    size_t i=_capStart; for(size_t n=0;n<_capCount;++n){ out+=(char)_capBuf[i]; if(++i==CAP_SIZE)i=0; }
+    out.reserve(_capCount + 64);
+    if (_capCount == 0) return;
+    size_t i = _capStart;
+    for (size_t n = 0; n < _capCount; ++n) {
+      out += (char)_capBuf[i];
+      if (++i == CAP_SIZE) i = 0;
+    }
   }
+
+  // Rolling log tail API
   uint32_t logSeq() const { return _logTotal; }
   void copySince(uint32_t sinceSeq, String& out, uint32_t& nextSeq, size_t maxChunk = 1024) const {
-    uint32_t total=_logTotal; int32_t delta=(int32_t)(total - sinceSeq);
-    if (delta<=0){ nextSeq=total; return; }
-    size_t avail=(size_t)delta; if (avail>LOG_SIZE){ avail=LOG_SIZE; sinceSeq=total-avail; }
+    uint32_t total = _logTotal;
+    int32_t delta = (int32_t)(total - sinceSeq);
+    if (delta <= 0) { nextSeq = total; return; }
+
+    size_t avail = (size_t)delta;
+    if (avail > LOG_SIZE) { avail = LOG_SIZE; sinceSeq = total - avail; }
+
     size_t startIndex = (_logWrite + LOG_SIZE - avail) % LOG_SIZE;
-    if (avail>maxChunk) avail=maxChunk;
-    out.reserve(out.length()+avail);
-    size_t i=startIndex; for(size_t n=0;n<avail;++n){ out+=(char)_logBuf[i]; if(++i==LOG_SIZE)i=0; }
+    if (avail > maxChunk) avail = maxChunk;
+
+    out.reserve(out.length() + avail);
+    size_t i = startIndex;
+    for (size_t n = 0; n < avail; ++n) {
+      out += (char)_logBuf[i];
+      if (++i == LOG_SIZE) i = 0;
+    }
     nextSeq = sinceSeq + avail;
   }
 
 private:
   // Early-capture ring
   static constexpr size_t CAP_SIZE = 4096;
-  uint8_t  _capBuf[CAP_SIZE]; size_t _capStart=0, _capCount=0; unsigned long _captureUntil=0;
-  void captureEarly(const uint8_t* buf,size_t len){
-    if ((int32_t)(millis()-_captureUntil)>0) return;
-    for(size_t i=0;i<len;++i){ if(_capCount<CAP_SIZE){ _capBuf[_capCount++]=buf[i]; }
-      else { _capBuf[_capStart]=buf[i]; _capStart=(_capStart+1)%CAP_SIZE; } }
+  uint8_t  _capBuf[CAP_SIZE];
+  size_t   _capStart = 0;
+  size_t   _capCount = 0;
+  unsigned long _captureUntil = 0;
+
+  void captureEarly(const uint8_t* buf, size_t len) {
+    if ((int32_t)(millis() - _captureUntil) > 0) return;
+    for (size_t i = 0; i < len; ++i) {
+      if (_capCount < CAP_SIZE) { _capBuf[_capCount++] = buf[i]; }
+      else { _capBuf[_capStart] = buf[i]; _capStart = (_capStart + 1) % CAP_SIZE; }
+    }
   }
+
   // Rolling log ring
   static constexpr size_t LOG_SIZE = 8192;
-  uint8_t  _logBuf[LOG_SIZE]; size_t _logWrite=0; uint32_t _logTotal=0;
-  void captureRolling(const uint8_t* buf,size_t len){ for(size_t i=0;i<len;++i){ _logBuf[_logWrite]=buf[i]; _logWrite=(_logWrite+1)%LOG_SIZE; _logTotal++; } }
+  uint8_t  _logBuf[LOG_SIZE];
+  size_t   _logWrite = 0;
+  uint32_t _logTotal = 0;
+
+  void captureRolling(const uint8_t* buf, size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+      _logBuf[_logWrite] = buf[i];
+      _logWrite = (_logWrite + 1) % LOG_SIZE;
+      _logTotal++;
+    }
+  }
 
   // Telnet server
-  WiFiServer _server; WiFiClient _client; bool _serverStarted=false, _wantServer=false;
+  WiFiServer _server;
+  WiFiClient _client;
+  bool _serverStarted = false;
+  bool _wantServer    = false;
 };
 
 // Replace Serial1 globally with the Telnet logger
 TelnetLogger TelnetSerial1(TELNET_PORT);
 #define Serial1 TelnetSerial1
+
+
+
 
 // ============================= Netif Utils =============================
 
