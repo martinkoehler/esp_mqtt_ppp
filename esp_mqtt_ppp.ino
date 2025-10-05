@@ -8,6 +8,10 @@
  *  - Telnet mirror for Serial1 logs on :2048 + early-boot capture
  *  - /logs (HTTP chunked live tail) + /logs.html (auto-reconnecting viewer)
  *  - Health monitor + PPP reconnect backoff (no heavy work in PPP callbacks)
+ *
+ * Notes (no NAT):
+ *  - The device is a PPP client; it does not NAT/forward AP clients to PPP.
+ *  - Use AP for setup/telemetry only, or add a route for 192.168.4.0/24 on the PPP peer.
  */
 
 #include <ESP8266WiFi.h>
@@ -42,6 +46,11 @@ static const uint16_t      MQTT_PORT        = 1883;
 #define MQTT_BURST_INTERVAL_MS   2
 #define MQTT_BURST_BUDGET_US     1200
 
+// AP policy (choose what you want)
+static const bool AP_ENABLE             = true;   // set false for PPP-only device
+static const bool AP_AUTO_OFF           = false;  // Do not turn AP off after a grace period
+static const uint32_t AP_AUTO_OFF_MS    = 10UL * 60UL * 1000UL; // 10 minutes
+
 // EEPROM layout
 #define EEPROM_SIZE 256
 #define SSID_ADDR   0
@@ -55,8 +64,11 @@ static const uint32_t TELEMETRY_EVERY_MS  = 30000;
 
 // ============================== Globals ================================
 
-char ap_ssid[MAX_SSID+1] = "WemosD1";
-char ap_pass[MAX_PASS+1] = "0187297154091575";
+#define AP_SSID "WemosD1"
+#define AP_PASS "0187297154091575"
+
+char ap_ssid[MAX_SSID+1] = AP_SSID;
+char ap_pass[MAX_PASS+1] = AP_PASS;
 
 MqttBroker broker(MQTT_PORT);
 static unsigned long lastMQTTBurst = 0;
@@ -74,6 +86,8 @@ static unsigned long lastTelemetryMs = 0;
 
 static String g_lastTelLine;
 static String g_lastNetifDump;
+
+static unsigned long g_ap_started_ms = 0;
 
 // ---- PPP deferred & backoff state ----
 static volatile bool g_ppp_up_flag = false;
@@ -290,8 +304,8 @@ void loadAPConfig() {
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.get(SSID_ADDR, ap_ssid);
   EEPROM.get(PASS_ADDR, ap_pass);
-  if (ap_ssid[0]==0xFF || ap_ssid[0]=='\0') strcpy(ap_ssid,"WemosD1");
-  if (ap_pass[0]==0xFF || ap_pass[0]=='\0') strcpy(ap_pass,"0187297154091575");
+  if (ap_ssid[0]==0xFF || ap_ssid[0]=='\0') strcpy(ap_ssid,AP_SSID);
+  if (ap_pass[0]==0xFF || ap_pass[0]=='\0') strcpy(ap_pass,AP_PASS);
   loadBootDiag(); // persisted boot diagnostics
 }
 void saveAPConfig(const char* ssid,const char* pass){
@@ -300,12 +314,18 @@ void saveAPConfig(const char* ssid,const char* pass){
   EEPROM.put(SSID_ADDR,ap_ssid); EEPROM.put(PASS_ADDR,ap_pass); EEPROM.commit();
 }
 void setupAP() {
+  if (!AP_ENABLE) {
+    WiFi.mode(WIFI_OFF);
+    Serial1.println("[AP] disabled by config");
+    return;
+  }
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(ap_ip, ap_gw, ap_mask);
   if (!WiFi.softAP(ap_ssid, ap_pass, AP_CHANNEL, false, 4)) {
     Serial1.println("[AP] start FAILED");
   } else {
     Serial1.printf("[AP] %s up at %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
+    g_ap_started_ms = millis();
   }
   wifi_set_sleep_type(NONE_SLEEP_T);
   dump_netifs("after softAP");
@@ -343,16 +363,27 @@ void setupPPP() {
 // ================================ Web UI ==============================
 
 void handleRoot() {
-  String html; html.reserve(9000);
-  html += F("<html><head><title>Wemos AP/PPP</title>"
+  String html; html.reserve(10000);
+  html += F("<html><head><title>Wemos PPP (no NAT)</title>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
             "<style>body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;padding:12px;}"
             "pre{background:#111;color:#eee;padding:8px;white-space:pre-wrap;word-break:break-word;border-radius:6px}"
             "a{color:#06c;text-decoration:none}a:hover{text-decoration:underline}"
             "h1,h2{margin:8px 0 6px}</style></head><body>");
-  html += F("<h1>Wemos AP/PPP</h1>");
+  html += F("<h1>Wemos PPP (no NAT)</h1>");
   html += F("<p><a href='/logs.html'>Open Live Logs</a></p>");
   html += F("<p>AP SSID: "); html += ap_ssid; html += F("</p>");
+
+  // PPP IP display
+  netif* p = nullptr; for (netif* it = netif_list; it; it = it->next) if (it->name[0]=='p' && it->name[1]=='p') { p = it; break; }
+  if (p && netif_is_up(p)) {
+    html += F("<p>PPP IP: ");
+    html += ipaddr_ntoa(netif_ip4_addr(p));
+    html += F("</p>");
+  }
+
+  html += F("<p><em>Note:</em> NAT is disabled. AP clients will <strong>not</strong> be forwarded to the PPP link. "
+            "Use the AP for device setup/telemetry only, or add a route for 192.168.4.0/24 on your PPP peer if you want reachability from that side.</p>");
 
   html += F("<h2>Connected AP Clients</h2><ul>");
   struct station_info *stat_info = wifi_softap_get_station_info();
@@ -497,7 +528,7 @@ static inline void serviceMQTT_timesliced() {
   }
 }
 void setupMQTT() { broker.begin(); mqttEverBegan = true; lastMQTTLoopTouchMs = millis();
-  Serial1.printf("[MQTT] TinyMqtt broker on :%u (AP+PPP)\n", MQTT_PORT); }
+  Serial1.printf("[MQTT] TinyMqtt broker on :%u (PPP, no NAT)\n", MQTT_PORT); }
 
 // ============================= Health Monitor =========================
 
@@ -510,9 +541,19 @@ const char* rstReasonToStr(uint32_t r) {
 netif* findPPP() { for (netif* n = netif_list; n; n = n->next) if (n->name[0]=='p'&&n->name[1]=='p') return n; return nullptr; }
 
 static void ensureAPUp() {
+  if (!AP_ENABLE) return; // honor config: do not auto-recreate AP if disabled
   const bool apMode = (WiFi.getMode() & WIFI_AP);
   if (!apMode) { Serial1.println("[HEALTH][AP] AP mode lost -> reconfig"); setupAP(); return; }
   if (WiFi.softAPIP() == IPAddress((uint32_t)0)) { Serial1.println("[HEALTH][AP] AP IP invalid -> reconfig"); setupAP(); }
+}
+static void maybeTurnOffAP() {
+  if (!AP_ENABLE || !AP_AUTO_OFF) return;
+  if (!(WiFi.getMode() & WIFI_AP)) return;
+  if (g_ap_started_ms == 0) return;
+  if ((uint32_t)(millis() - g_ap_started_ms) < AP_AUTO_OFF_MS) return;
+
+  Serial1.println("[AP] auto-off: disabling AP (PPP remains active)");
+  WiFi.mode(WIFI_OFF); // fully disable AP (can switch to STA later if desired)
 }
 static void ppp_schedule_reconnect(unsigned long now) {
   if (g_ppp_next_reconnect_ms) return;
@@ -567,7 +608,7 @@ static void serviceHealth() {
   const unsigned long now = millis();
   if ((uint32_t)(now - lastHealthTickMs) < HEALTH_EVERY_MS) return;
   lastHealthTickMs = now;
-  ensureAPUp(); ensurePPPUp(); servicePPPDeferred(); ensureWebUp(); ensureMQTTUp(); ensureTelnetUp();
+  ensureAPUp(); maybeTurnOffAP(); ensurePPPUp(); servicePPPDeferred(); ensureWebUp(); ensureMQTTUp(); ensureTelnetUp();
   if ((uint32_t)(now - lastTelemetryMs) >= TELEMETRY_EVERY_MS) { lastTelemetryMs = now; logTelemetry(); }
 }
 
