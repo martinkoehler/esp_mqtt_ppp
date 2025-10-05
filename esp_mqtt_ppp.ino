@@ -1,10 +1,9 @@
 /**
- * esp_mqtt_ppp_nat_telnet_health_ppp_hardened_nophase.ino
+ * esp_mqtt_ppp_telnet_health_ppp_hardened_nophase.ino
  *
  * ESP8266 (Wemos D1):
  *  - SoftAP + simple web UI (status, config, boot diagnostics, telemetry, logs)
  *  - PPPoS over UART0 (Serial) as WAN uplink
- *  - NAPT (NAT) on PPP interface for AP clients (deferred enabling)
  *  - TinyMqtt broker on :1883 with time-sliced loop
  *  - Telnet mirror for Serial1 logs on :2048 + early-boot capture
  *  - /logs (HTTP chunked live tail) + /logs.html (auto-reconnecting viewer)
@@ -26,7 +25,6 @@ extern "C" {
   #include "lwip/etharp.h"
   #include "lwip/ip4.h"
   #include "lwip/ip4_addr.h"
-  #include "lwip/napt.h"
   #include "user_interface.h"
 }
 
@@ -52,13 +50,6 @@ static const uint16_t      MQTT_PORT        = 1883;
 #define MAX_SSID    31
 #define MAX_PASS    31
 
-#ifndef IP_NAPT_MAX
-#define IP_NAPT_MAX     512
-#endif
-#ifndef IP_PORTMAP_MAX
-#define IP_PORTMAP_MAX  32
-#endif
-
 static const uint32_t HEALTH_EVERY_MS     = 3000;
 static const uint32_t TELEMETRY_EVERY_MS  = 30000;
 
@@ -66,8 +57,6 @@ static const uint32_t TELEMETRY_EVERY_MS  = 30000;
 
 char ap_ssid[MAX_SSID+1] = "WemosD1";
 char ap_pass[MAX_PASS+1] = "0187297154091575";
-
-static bool napt_inited = false;
 
 MqttBroker broker(MQTT_PORT);
 static unsigned long lastMQTTBurst = 0;
@@ -90,7 +79,6 @@ static String g_lastNetifDump;
 static volatile bool g_ppp_up_flag = false;
 static volatile bool g_ppp_err_flag = false;
 static volatile int  g_ppp_err_code = 0;
-static volatile bool g_enable_nat_deferred = false;
 
 static unsigned long g_ppp_next_reconnect_ms = 0;
 static uint16_t      g_ppp_reconnect_backoff_ms = 500;  // start small
@@ -157,7 +145,6 @@ public:
       _client.println();
 
       // --- Show persisted Boot Diagnostics immediately ---
-      // (uses globals from the BootDiag block defined earlier in the file)
       _client.println("=== Boot Diagnostics (persisted) ===");
       _client.print("BootCount: "); _client.println((unsigned long)g_bootdiag.bootCount);
       _client.print("Reason   : "); _client.println((unsigned long)g_bootdiag.reason);
@@ -283,9 +270,6 @@ private:
 TelnetLogger TelnetSerial1(TELNET_PORT);
 #define Serial1 TelnetSerial1
 
-
-
-
 // ============================= Netif Utils =============================
 
 void dump_netifs_to(String& out, const char* tag) {
@@ -327,28 +311,14 @@ void setupAP() {
   dump_netifs("after softAP");
 }
 
-// ========================= PPP / NAT Bring-up =========================
+// ========================= PPP Bring-up =========================
 
 static u32_t ppp_output_cb(ppp_pcb *, u8_t *data, u32_t len, void *) { return Serial.write(data, len); }
 
-static void enable_nat_on_ppp_if_available() {
-  netif* n = nullptr;
-  for (netif* it = netif_list; it; it = it->next) { if (it->name[0]=='p' && it->name[1]=='p'){ n=it; break; } }
-  if (!n) { Serial1.println("[NAT] PPP netif not found yet"); return; }
-  if (!napt_inited) {
-    ip_napt_init(IP_NAPT_MAX, IP_PORTMAP_MAX); napt_inited = true;
-    Serial1.printf("[NAT] napt_init done (max=%d portmaps=%d)\n", IP_NAPT_MAX, IP_PORTMAP_MAX);
-  }
-  err_t er = ip_napt_enable_no(n->num, 1);
-  Serial1.printf("[NAT] ip_napt_enable_no(ppp #%u) -> %d\n", n->num, (int)er);
-  if (er==ERR_OK) { Serial1.printf("[NAT] enabled on PPP address %s\n", ipaddr_ntoa(netif_ip_addr4(n))); }
-}
-
-// PPP status callback: DEFER heavy work
+// PPP status callback: no heavy work here
 static void ppp_status_cb(ppp_pcb *, int err_code, void *) {
   if (err_code == PPPERR_NONE) {
     g_ppp_up_flag = true;
-    g_enable_nat_deferred = true;
     Serial1.println("[PPP] status: UP");
   } else {
     g_ppp_err_flag = true;
@@ -374,13 +344,13 @@ void setupPPP() {
 
 void handleRoot() {
   String html; html.reserve(9000);
-  html += F("<html><head><title>Wemos AP/PPP NAT</title>"
+  html += F("<html><head><title>Wemos AP/PPP</title>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
             "<style>body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;padding:12px;}"
             "pre{background:#111;color:#eee;padding:8px;white-space:pre-wrap;word-break:break-word;border-radius:6px}"
             "a{color:#06c;text-decoration:none}a:hover{text-decoration:underline}"
             "h1,h2{margin:8px 0 6px}</style></head><body>");
-  html += F("<h1>Wemos AP/PPP NAT</h1>");
+  html += F("<h1>Wemos AP/PPP</h1>");
   html += F("<p><a href='/logs.html'>Open Live Logs</a></p>");
   html += F("<p>AP SSID: "); html += ap_ssid; html += F("</p>");
 
@@ -555,20 +525,21 @@ static void ensurePPPUp() {
   netif* n = findPPP();
   if (!ppp) { Serial1.println("[HEALTH][PPP] pcb null -> recreate"); setupPPP(); return; }
   if (!n || !netif_is_up(n)) { Serial1.println("[HEALTH][PPP] netif down/missing -> schedule reconnect"); ppp_schedule_reconnect(millis()); return; }
-  // NAT enabling is deferred on UP event.
 }
 static void servicePPPDeferred() {
   const unsigned long now = millis();
-  static bool pending_nat = false; static unsigned long nat_enable_at = 0;
 
   if (g_ppp_up_flag) {
-    g_ppp_up_flag = false; pending_nat = true; nat_enable_at = now + 250;
-    g_ppp_reconnect_backoff_ms = 500; Serial1.println("[PPP] UP event consumed; NAT enable scheduled");
+    g_ppp_up_flag = false;
+    g_ppp_reconnect_backoff_ms = 500;
+    Serial1.println("[PPP] UP event consumed");
+    dump_netifs("PPP UP");
   }
-  if (pending_nat && (int32_t)(now - nat_enable_at) >= 0) {
-    pending_nat = false; if (g_enable_nat_deferred) { g_enable_nat_deferred = false; enable_nat_on_ppp_if_available(); dump_netifs("PPP UP (after NAPT)"); }
+  if (g_ppp_err_flag) {
+    g_ppp_err_flag = false;
+    Serial1.printf("[PPP] error event: code=%d\n", g_ppp_err_code);
+    ppp_schedule_reconnect(now);
   }
-  if (g_ppp_err_flag) { g_ppp_err_flag = false; Serial1.printf("[PPP] error event: code=%d\n", g_ppp_err_code); ppp_schedule_reconnect(now); }
   if (g_ppp_next_reconnect_ms && (int32_t)(now - g_ppp_next_reconnect_ms) >= 0) {
     g_ppp_next_reconnect_ms = 0;
     if (ppp) { Serial1.println("[PPP] reconnecting now…"); ppp_connect(ppp, 0); }
