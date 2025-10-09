@@ -1,5 +1,5 @@
 /**
- * esp_mqtt_ppp_telnet_health_ppp_hardened_nophase.ino
+ * esp_mqtt_ppp_telnet_health_ppp_hardened_nophase_PATCHED.ino
  *
  * ESP8266 (Wemos D1):
  *  - SoftAP + simple web UI (status, config, boot diagnostics, telemetry, logs)
@@ -12,6 +12,11 @@
  * Notes (no NAT):
  *  - The device is a PPP client; it does not NAT/forward AP clients to PPP.
  *  - Use AP for setup/telemetry only, or add a route for 192.168.4.0/24 on the PPP peer.
+ *
+ * PATCHES in this version:
+ *  - TelnetLogger::write() no longer calls _client.write() (no socket I/O in ISR/lwIP/PPP contexts).
+ *  - Telnet flushing happens in TelnetLogger::loop() only.
+ *  - ppp_status_cb() does not log anymore; it only flips flags (logging deferred).
  */
 
 #include <ESP8266WiFi.h>
@@ -128,6 +133,8 @@ void saveBootDiag() { EEPROM.put(DIAG_ADDR, g_bootdiag); EEPROM.commit(); }
  *  - Captures the first EARLY_LOG_MS of output (RAM ring) for the web UI.
  *  - Maintains an always-on 8KB rolling buffer for HTTP live tail (/logs).
  *  - On Telnet connect: prints persisted Boot Diagnostics + Early Boot Log.
+ *
+ * PATCH: write() -> no socket I/O; telnet flushing happens in loop().
  */
 class TelnetLogger : public Print {
 public:
@@ -137,6 +144,7 @@ public:
     ::Serial1.begin(baud);
     _wantServer = true;
     _captureUntil = millis() + EARLY_LOG_MS;   // early-capture window
+    _lastTelnetSeq = 0;
   }
 
   void loop() {
@@ -149,8 +157,11 @@ public:
     // Accept/rotate single client
     if (_serverStarted && _server.hasClient()) {
       if (_client && _client.connected()) _client.stop();
-      _client = _server.available();
+      _client = _server.accept();
       _client.setNoDelay(true);
+
+      // Start telnet stream from "now"
+      _lastTelnetSeq = logSeq();
 
       // Greeting
       _client.println("ESP8266 Serial1 log (Telnet). Close client to detach.");
@@ -189,19 +200,27 @@ public:
     if (_client && !_client.connected()) {
       _client.stop();
     }
+
+    // PATCH: Flush log ring to telnet client from main loop only
+    if (_client && _client.connected()) {
+      String chunk; uint32_t nextSeq = _lastTelnetSeq;
+      copySince(_lastTelnetSeq, chunk, nextSeq, 1024); // throttle ~1KB/loop
+      if (!chunk.isEmpty()) {
+        (void)_client.print(chunk); // best-effort
+        _lastTelnetSeq = nextSeq;
+      }
+    }
   }
 
-  // ---- Print proxy: write to UART1 + Telnet + capture buffers ----
+  // ---- Print proxy: write to UART1 + capture buffers (NO socket I/O) ----
   size_t write(uint8_t b) override {
     ::Serial1.write(b);
-    if (_client && _client.connected()) _client.write(&b, 1);
     captureEarly(&b, 1);
     captureRolling(&b, 1);
     return 1;
   }
   size_t write(const uint8_t* buf, size_t size) override {
     ::Serial1.write(buf, size);
-    if (_client && _client.connected()) _client.write(buf, size);
     captureEarly(buf, size);
     captureRolling(buf, size);
     return size;
@@ -276,6 +295,9 @@ private:
   WiFiClient _client;
   bool _serverStarted = false;
   bool _wantServer    = false;
+
+  // PATCH: last position flushed to the telnet client
+  uint32_t _lastTelnetSeq = 0;
 };
 
 // Replace Serial1 globally with the Telnet logger
@@ -333,16 +355,16 @@ void setupAP() {
 
 static u32_t ppp_output_cb(ppp_pcb *, u8_t *data, u32_t len, void *) { return Serial.write(data, len); }
 
-// PPP status callback: no heavy work here
+// PPP status callback: NO LOGGING HERE (defer to main loop)
 static void ppp_status_cb(ppp_pcb *, int err_code, void *) {
   if (err_code == PPPERR_NONE) {
     g_ppp_up_flag = true;
-    Serial1.println("[PPP] status: UP");
+    // (no Serial1 prints here)
   } else {
     g_ppp_err_flag = true;
     g_ppp_up_flag = false;
     g_ppp_err_code = err_code;
-    Serial1.printf("[PPP] status: ERR=%d (defer reconnect)\n", err_code);
+    // (no Serial1 prints here)
   }
 }
 
@@ -517,7 +539,7 @@ void setupWeb() {
 // ================================ MQTT ================================
 static inline void serviceMQTT() {
   const unsigned long now = millis();
-  broker.loop(); 
+  broker.loop();
   lastMQTTBurst = now; lastMQTTLoopTouchMs = now;
   yield();
 };
@@ -630,7 +652,7 @@ void setup() {
 
   loadAPConfig(); // also loads persisted boot diag
 
-  // Persist boot diagnostics for THIS boot
+    // Persist boot diagnostics for THIS boot
   struct rst_info* ri = system_get_rst_info();
   g_bootdiag.magic=BOOTDIAG_MAGIC; g_bootdiag.bootCount=g_bootdiag.bootCount+1;
   g_bootdiag.reason=ri->reason; g_bootdiag.exccause=ri->exccause;
