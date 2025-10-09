@@ -43,8 +43,6 @@ static const int           AP_CHANNEL       = 6;
 IPAddress ap_ip(192,168,4,1), ap_gw(192,168,4,1), ap_mask(255,255,255,0);
 
 static const uint16_t      MQTT_PORT        = 1883;
-#define MQTT_BURST_INTERVAL_MS   2
-#define MQTT_BURST_BUDGET_US     1200
 
 // AP policy (choose what you want)
 static const bool AP_ENABLE             = true;   // set false for PPP-only device
@@ -517,16 +515,13 @@ void setupWeb() {
 }
 
 // ================================ MQTT ================================
-
-static inline void serviceMQTT_timesliced() {
+static inline void serviceMQTT() {
   const unsigned long now = millis();
-  if ((uint32_t)(now - lastMQTTBurst) >= MQTT_BURST_INTERVAL_MS) {
-    const uint32_t deadline = micros() + MQTT_BURST_BUDGET_US;
-    do { broker.loopWithBudget(MQTT_BURST_BUDGET_US); yield(); }
-    while ((int32_t)(deadline - micros()) > 0);
-    lastMQTTBurst = now; lastMQTTLoopTouchMs = now;
-  }
-}
+  broker.loop(); 
+  lastMQTTBurst = now; lastMQTTLoopTouchMs = now;
+  yield();
+};
+
 void setupMQTT() { broker.begin(); mqttEverBegan = true; lastMQTTLoopTouchMs = millis();
   Serial1.printf("[MQTT] TinyMqtt broker on :%u (PPP, no NAT)\n", MQTT_PORT); }
 
@@ -663,6 +658,6 @@ void setup() {
 }
 
 void loop() {
-  servicePPP(); serviceHTTP(); serviceMQTT_timesliced();
+  servicePPP(); serviceHTTP(); serviceMQTT();
   Serial1.loop(); serviceHealth(); yield();
 }
