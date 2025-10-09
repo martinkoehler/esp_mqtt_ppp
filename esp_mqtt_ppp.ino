@@ -1,8 +1,8 @@
 /**
- * esp_mqtt_ppp_web_clean.ino
+ * esp_mqtt_ppp_web_clean_with_clients.ino
  *
  * ESP8266 (Wemos D1):
- *  - Optional SoftAP + simple web UI (status, config, boot diagnostics, telemetry)
+ *  - Optional SoftAP + simple web UI (status, AP client IPs, config, boot diagnostics, telemetry)
  *  - PPPoS over UART0 (Serial) as WAN uplink
  *  - TinyMqtt broker on :1883 with time-sliced loop
  *  - Health monitor + PPP reconnect backoff (no work in PPP callbacks)
@@ -149,7 +149,7 @@ static void saveAPConfig(const char* ssid,const char* pass){
 static void setupAP() {
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(ap_ip, ap_gw, ap_mask);
-  if (!WiFi.softAP(ap_ssid, ap_pass, AP_CHANNEL, false, 4)) {
+  if (!WiFi.softAP(ap_ssid, ap_pass, AP_CHANNEL, false, 4)) {   // max 4 clients
     Serial1.println("[AP] start FAILED");
   } else {
     Serial1.printf("[AP] %s up at %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
@@ -191,21 +191,55 @@ static void setupPPP() {
   Serial1.println("[PPP] connecting...");
 }
 
+// ========================= Safe AP client list (IPs) ==========================
+
+#if AP_ENABLE
+static void buildClientIPsHTML(String& out) {
+  // Only attempt if AP is active
+  if (!(WiFi.getMode() & WIFI_AP)) { out += F("<p>AP not active.</p>"); return; }
+
+  const int count = wifi_softap_get_station_num();
+  out += F("<h3>Connected AP Clients</h3>");
+  out += F("<p>Count: "); out += String(count); out += F("</p>");
+
+  if (count <= 0) { out += F("<ul></ul>"); return; }
+
+  // Copy IPs from SDK list into a temporary array, then free the list immediately.
+  struct station_info* list = wifi_softap_get_station_info();
+  int copied = 0;
+  IPAddress* ips = (count > 0) ? new IPAddress[count] : nullptr;
+
+  for (struct station_info* s = list; s && copied < count; s = STAILQ_NEXT(s, next)) {
+    ips[copied++] = IPAddress(s->ip.addr);
+  }
+  wifi_softap_free_station_info(); // release SDK memory promptly
+
+  out += F("<ul>");
+  for (int i = 0; i < copied; ++i) {
+    out += F("<li>"); out += ips[i].toString(); out += F("</li>");
+  }
+  out += F("</ul>");
+
+  delete[] ips;
+}
+#endif
+
 // ================================ Web UI ======================================
 
 static void handleRoot() {
-  String html; html.reserve(8000);
+  String html; html.reserve(9000);
   html += F("<html><head><title>Wemos PPP (no NAT)</title>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
             "<style>body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;padding:12px;}"
             "pre{background:#111;color:#eee;padding:8px;white-space:pre-wrap;word-break:break-word;border-radius:6px}"
             "a{color:#06c;text-decoration:none}a:hover{text-decoration:underline}"
-            "h1,h2{margin:8px 0 6px}</style></head><body>");
+            "h1,h2,h3{margin:8px 0 6px}</style></head><body>");
   html += F("<h1>Wemos PPP (no NAT)</h1>");
 
 #if AP_ENABLE
+  html += F("<h2>Access Point</h2>");
   html += F("<p>AP SSID: "); html += ap_ssid; html += F("</p>");
-  html += F("<p>AP Stations: "); html += String(wifi_softap_get_station_num()); html += F("</p>");
+  buildClientIPsHTML(html);
 #else
   html += F("<p>AP: <em>disabled at compile time</em></p>");
 #endif
@@ -213,7 +247,7 @@ static void handleRoot() {
   // PPP IP display
   netif* p = nullptr; for (netif* it = netif_list; it; it = it->next) if (it->name[0]=='p' && it->name[1]=='p') { p = it; break; }
   if (p && netif_is_up(p)) {
-    html += F("<p>PPP IP: ");
+    html += F("<h2>PPP Link</h2><p>PPP IP: ");
     html += ipaddr_ntoa(netif_ip4_addr(p));
     html += F("</p>");
   }
