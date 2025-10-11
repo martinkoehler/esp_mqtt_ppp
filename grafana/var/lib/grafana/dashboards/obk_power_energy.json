@@ -1,0 +1,59 @@
+{
+  "id": null,
+  "uid": "obk-power-energy",
+  "title": "OpenBeken – Power & Energy",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["OpenBeken","MQTT","SQLite"],
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "device",
+        "label": "Device",
+        "type": "textbox",
+        "query": "",
+        "current": { "text": "obk681BA32A", "value": "obk681BA32A" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Instant Power (W)",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "watt", "custom": { "drawStyle": "line", "lineInterpolation": "smooth" } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "frser-sqlite-datasource", "name": "MQTT SQLite" },
+          "format": "table",
+          "queryText": "SELECT ts*1000 AS time, CAST(payload AS REAL) AS value\nFROM messages\nWHERE topic = '${device}/power/get'\nORDER BY ts;"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Total Energy (kWh)",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "kwh", "custom": { "drawStyle": "line", "lineInterpolation": "stepBefore" } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "B",
+          "datasource": { "type": "frser-sqlite-datasource", "name": "MQTT SQLite" },
+          "format": "table",
+          "queryText": "SELECT ts*1000 AS time, CAST(payload AS REAL) AS value\nFROM messages\nWHERE topic = '${device}/energycounter/get'\nORDER BY ts;"
+        }
+      ]
+    }
+  ]
+}
+

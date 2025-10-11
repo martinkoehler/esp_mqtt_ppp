@@ -1,0 +1,142 @@
+A Grafana Dashboard for the SQLite
+
+1) Install Grafana + SQLite plugin (Ubuntu)
+
+# Install Grafana (OSS)
+
+# 1) Basics
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+
+# 2) GPG-Key speichern
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://packages.grafana.com/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/grafana.gpg
+sudo chmod a+r /etc/apt/keyrings/grafana.gpg
+
+# 3) Repo eintragen (OSS-Variante)
+echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://packages.grafana.com/oss/deb stable main" \
+| sudo tee /etc/apt/sources.list.d/grafana.list > /dev/null
+
+# 4) Aktualisieren + installieren
+sudo apt-get update
+sudo apt-get install -y grafana
+
+# 5) Starten & aktivieren
+sudo systemctl daemon-reload
+sudo systemctl enable --now grafana-server
+
+
+
+# Install the SQLite datasource plugin
+sudo /usr/sbin/grafana-cli plugins install frser-sqlite-datasource
+
+# Start + enable
+sudo systemctl daemon-reload
+sudo systemctl enable --now grafana-server
+
+
+2) Point Grafana to your SQLite DB (provisioning)
+
+Create /etc/grafana/provisioning/datasources/sqlite.yaml:
+
+
+apiVersion: 1
+
+datasources:
+  - name: MQTT SQLite
+    type: frser-sqlite-datasource
+    access: proxy
+    isDefault: true
+    editable: true
+    jsonData:
+      path: ../freetz-ng/mqtt_to_sqlite/mqtt_messages.db
+
+
+
+3) Provision the dashboard
+
+Create the dashboard JSON at /var/lib/grafana/dashboards/obk_power_energy.json:
+
+{
+  "id": null,
+  "uid": "obk-power-energy",
+  "title": "OpenBeken – Power & Energy",
+  "version": 1,
+  "schemaVersion": 39,
+  "tags": ["OpenBeken", "MQTT", "SQLite"],
+  "timezone": "",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "device",
+        "label": "Device",
+        "type": "textbox",
+        "query": "",
+        "current": { "text": "obk681BA32A", "value": "obk681BA32A" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Instant Power (W)",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "grafana-sqlite-ds" },
+          "format": "table",
+          "refId": "A",
+          "queryText": "SELECT ts*1000 AS time, CAST(payload AS REAL) AS value\nFROM messages\nWHERE topic = ($device || '/power/get')\nORDER BY ts;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "watt", "custom": { "drawStyle": "line", "lineInterpolation": "smooth" } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Total Energy (kWh)",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "grafana-sqlite-ds" },
+          "format": "table",
+          "refId": "B",
+          "queryText": "SELECT ts*1000 AS time, CAST(payload AS REAL) AS value\nFROM messages\nWHERE topic = ($device || '/energycounter/get')\nORDER BY ts;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "kwh", "custom": { "drawStyle": "line", "lineInterpolation": "stepBefore" } },
+        "overrides": []
+      }
+    }
+  ]
+}
+
+
+Create a dashboards provisioning file /etc/grafana/provisioning/dashboards/obk.yaml:
+
+apiVersion: 1
+
+providers:
+  - name: 'OpenBeken dashboards'
+    orgId: 1
+    folder: 'OpenBeken'
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
+
+
+Restart Grafana:
+
+sudo systemctl restart grafana-server
+
+
+Open Grafana → Dashboards → Folder OpenBeken → OpenBeken – Power & Energy.
+If your device ID changes, use the Device textbox (top-left of the dashboard) to set it (e.g., obk681BA32A).

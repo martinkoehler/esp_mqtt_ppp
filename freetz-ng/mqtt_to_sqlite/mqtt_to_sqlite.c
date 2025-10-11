@@ -1,22 +1,10 @@
 // mqtt_to_sqlite.c
-// Build-time deps: libmosquitto-dev, libsqlite3-dev
-// Runtime deps: libmosquitto, sqlite3
-//
-// Behavior:
-// - Connects to MQTT broker at 192.168.4.1
-// - Subscribes to "obk/#" (covers your OpenBeken topics like obk681BA32A/...)
-// - Inserts every message into SQLite (mqtt_messages.db)
-// - On disconnect, runs NETWORK_FIX_SCRIPT (default ./handle_network_error.sh) and retries with backoff
-//
-// Env overrides (optional):
-//   MQTT_BROKER      (default "192.168.4.1")
-//   MQTT_PORT        (default "1883")
-//   MQTT_CLIENT_ID   (default auto-generated)
-//   MQTT_TOPIC       (default "#")
-//   MQTT_DB_PATH     (default "./mqtt_messages.db")
-//   NETWORK_FIX_SCRIPT (default "./handle_network_error.sh")
-//   RECONNECT_MIN_S  (default "2")
-//   RECONNECT_MAX_S  (default "60")
+// Robust MQTT->SQLite collector that never exits on network errors.
+// Changes vs. previous:
+//  - Manual loop with mosquitto_loop() and explicit reconnect logic.
+//  - Sleep after running network repair script.
+//  - Exponential backoff between reconnect attempts.
+//  - Exits ONLY on SIGINT/SIGTERM.
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -39,17 +27,16 @@ static struct mosquitto *g_mosq = NULL;
 
 static char g_broker_host[128] = "192.168.4.1";
 static int  g_broker_port = 1883;
-static char g_topic[128] = "#";
+static char g_topic[128] = "#";  // subscribe to all (your request)
 static char g_db_path[256] = "./mqtt_messages.db";
 static char g_netfix_script[256] = "./handle_network_error.sh";
-static int  g_reconnect_min = 2;
-static int  g_reconnect_max = 60;
 
-// Throttle running the repair script (avoid spamming)
+static int  g_reconnect_min = 2;    // seconds
+static int  g_reconnect_max = 60;   // seconds
+static int  g_sleep_after_script = 5; // seconds
+
 static time_t g_last_script_run = 0;
 static const int SCRIPT_MIN_INTERVAL_SEC = 20;
-
-// --- helpers
 
 static const char *env_or_default(const char *name, const char *defval) {
     const char *v = getenv(name);
@@ -66,14 +53,6 @@ static int env_or_default_int(const char *name, int defval) {
     return (int)x;
 }
 
-static void install_sig_handlers(void);
-
-static void on_signal(int sig) {
-    (void)sig;
-    g_should_stop = 1;
-    if (g_mosq) mosquitto_disconnect(g_mosq);
-}
-
 static void log_ts(const char *level, const char *msg) {
     time_t now = time(NULL);
     struct tm tm;
@@ -81,6 +60,45 @@ static void log_ts(const char *level, const char *msg) {
     char buf[64];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
     fprintf(stderr, "[%s] [%s] %s\n", buf, level, msg);
+}
+
+static int g_log_inserts = -1; // -1 = uninitialized
+
+static void init_log_inserts(void) {
+    if (g_log_inserts == -1) {
+        const char *v = getenv("MQTT_LOG_INSERTS");
+        g_log_inserts = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+}
+
+static void print_inserted_message(time_t ts, const char *topic, const void *payload, int payloadlen, int qos, int retain) {
+    init_log_inserts();
+    if (!g_log_inserts) return;
+
+    enum { MAX_SHOW = 256 };
+    char show[MAX_SHOW + 1];
+    int n = (payloadlen < MAX_SHOW) ? payloadlen : MAX_SHOW;
+    for (int i = 0; i < n; ++i) {
+        unsigned char c = ((const unsigned char*)payload)[i];
+        // keep readable; escape control chars
+        show[i] = (c >= 32 && c <= 126) ? (char)c : '.';
+    }
+    show[n] = '\0';
+
+    char tbuf[64];
+    struct tm tm;
+    localtime_r(&ts, &tm);
+    strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tm);
+
+    fprintf(stderr,
+            "[%s] [DB+] topic='%s' qos=%d retain=%d payload_len=%d payload='%s'%s\n",
+            tbuf, topic, qos, retain, payloadlen, show,
+            (payloadlen > MAX_SHOW ? "…" : ""));
+}
+
+static void on_signal(int sig) {
+    (void)sig;
+    g_should_stop = 1;
 }
 
 static int run_network_repair_script(void) {
@@ -94,20 +112,22 @@ static int run_network_repair_script(void) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "sh -c '%s'", g_netfix_script);
 
-    fprintf(stderr, "Running network repair script: %s\n", cmd);
+    char msg[512];
+    snprintf(msg, sizeof(msg), "Running network repair script: %s", g_netfix_script);
+    log_ts("WARN", msg);
+
     int rc = system(cmd);
     if (rc == -1) {
         perror("system");
         return -1;
     } else {
-        char msg[128];
         snprintf(msg, sizeof(msg), "Network repair script exit code: %d", WEXITSTATUS(rc));
         log_ts("INFO", msg);
     }
     return 0;
 }
 
-// --- SQLite
+/* ---------- SQLite ---------- */
 
 static int db_init(const char *path) {
     int rc = sqlite3_open(path, &g_db);
@@ -115,8 +135,7 @@ static int db_init(const char *path) {
         fprintf(stderr, "sqlite3_open failed: %s\n", sqlite3_errmsg(g_db));
         return -1;
     }
-
-    // Fast-ish settings for low-end devices; safe for single-writer
+    // Tolerant pragmas for low-end devices and concurrent readers like Grafana.
     sqlite3_exec(g_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_exec(g_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     sqlite3_exec(g_db, "PRAGMA temp_store=MEMORY;", NULL, NULL, NULL);
@@ -124,7 +143,7 @@ static int db_init(const char *path) {
     const char *ddl =
         "CREATE TABLE IF NOT EXISTS messages ("
         "  id       INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "  ts       INTEGER NOT NULL,"         // Unix epoch seconds
+        "  ts       INTEGER NOT NULL,"
         "  topic    TEXT    NOT NULL,"
         "  payload  TEXT    NOT NULL,"
         "  qos      INTEGER NOT NULL,"
@@ -150,35 +169,24 @@ static int db_init(const char *path) {
         fprintf(stderr, "sqlite3_prepare_v2 failed: %s\n", sqlite3_errmsg(g_db));
         return -1;
     }
-
     return 0;
 }
 
 static void db_close(void) {
-    if (g_stmt_insert) {
-        sqlite3_finalize(g_stmt_insert);
-        g_stmt_insert = NULL;
-    }
-    if (g_db) {
-        sqlite3_close(g_db);
-        g_db = NULL;
-    }
+    if (g_stmt_insert) { sqlite3_finalize(g_stmt_insert); g_stmt_insert = NULL; }
+    if (g_db) { sqlite3_close(g_db); g_db = NULL; }
 }
 
 static void db_insert_message(const char *topic, const void *payload, int payloadlen, int qos, int retain) {
     if (!g_stmt_insert) return;
-
     time_t now = time(NULL);
 
-    // Bind and execute
     sqlite3_reset(g_stmt_insert);
     sqlite3_clear_bindings(g_stmt_insert);
 
     sqlite3_bind_int64(g_stmt_insert, 1, (sqlite3_int64)now);
     sqlite3_bind_text (g_stmt_insert, 2, topic, -1, SQLITE_TRANSIENT);
 
-    // Ensure payload is stored as UTF-8 text; if not, we still store raw bytes interpreted as text.
-    // If you prefer BLOB, change the column type and bind with sqlite3_bind_blob.
     char *pl = NULL;
     if (payload && payloadlen >= 0) {
         pl = (char*)malloc((size_t)payloadlen + 1);
@@ -194,54 +202,61 @@ static void db_insert_message(const char *topic, const void *payload, int payloa
     int rc = sqlite3_step(g_stmt_insert);
     if (rc != SQLITE_DONE) {
         fprintf(stderr, "sqlite3_step(insert) failed: %s\n", sqlite3_errmsg(g_db));
+    } else {
+        print_inserted_message(now, topic, payload, payloadlen, qos, retain);
     }
 
     if (pl) free(pl);
 }
 
-// --- MQTT callbacks
+/* ---------- MQTT callbacks (lightweight; no exits) ---------- */
 
 static void handle_connect(struct mosquitto *mosq, void *obj, int rc) {
     (void)obj;
-    char buf[128];
-    snprintf(buf, sizeof(buf), "Connected with rc=%d", rc);
+    (void)mosq;
+
+    enum { TOPIC_PREVIEW = 120 };
+    char topic_preview[TOPIC_PREVIEW + 1];
+    size_t tlen = strlen(g_topic);
+    if (tlen > TOPIC_PREVIEW) {
+        memcpy(topic_preview, g_topic, TOPIC_PREVIEW);
+        topic_preview[TOPIC_PREVIEW] = '\0';
+    } else {
+        memcpy(topic_preview, g_topic, tlen + 1);
+    }
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "Connected (rc=%d), subscribing to '%s'%s",
+             rc,
+             topic_preview,
+             (tlen > TOPIC_PREVIEW ? "…" : ""));
     log_ts("INFO", buf);
 
     if (rc == 0) {
         int s = mosquitto_subscribe(mosq, NULL, g_topic, 0);
         if (s != MOSQ_ERR_SUCCESS) {
             fprintf(stderr, "mosquitto_subscribe failed: %s\n", mosquitto_strerror(s));
-        } else {
-            fprintf(stderr, "Subscribed to %s\n", g_topic);
         }
     }
 }
 
+
 static void handle_disconnect(struct mosquitto *mosq, void *obj, int rc) {
     (void)mosq; (void)obj;
-    char buf[128];
-    snprintf(buf, sizeof(buf), "Disconnected (rc=%d). Attempting repair + reconnect…", rc);
+    char buf[160];
+    snprintf(buf, sizeof(buf), "Disconnected (rc=%d). Will try to recover…", rc);
     log_ts("WARN", buf);
-
-    run_network_repair_script();
-    // Reconnect attempts are handled by mosquitto_loop_forever with reconnect_delay_set
+    // NOTE: We do NOT exit here; the main loop will handle reconnects.
 }
 
 static void handle_message(struct mosquitto *mosq, void *obj, const struct mosquitto_message *msg) {
     (void)mosq; (void)obj;
     if (!msg) return;
-
-    db_insert_message(msg->topic,
-                      msg->payload,
-                      msg->payloadlen,
-                      msg->qos,
-                      msg->retain);
-
-    // Optional: small console trace for visibility
-    fprintf(stderr, "MSG %s => %.*s\n", msg->topic, msg->payloadlen, (const char*)msg->payload);
+    db_insert_message(msg->topic, msg->payload, msg->payloadlen, msg->qos, msg->retain);
 }
 
-// --- main
+/* ---------- util ---------- */
 
 static void install_sig_handlers(void) {
     struct sigaction sa;
@@ -251,15 +266,18 @@ static void install_sig_handlers(void) {
     sigaction(SIGTERM, &sa, NULL);
 }
 
+/* ---------- main ---------- */
+
 int main(void) {
-    // Read env overrides
+    // Env overrides
     snprintf(g_broker_host, sizeof(g_broker_host), "%s", env_or_default("MQTT_BROKER", "192.168.4.1"));
     g_broker_port = env_or_default_int("MQTT_PORT", 1883);
-    snprintf(g_topic, sizeof(g_topic), "%s", env_or_default("MQTT_TOPIC", "#"));
+    snprintf(g_topic, sizeof(g_topic), "%s", env_or_default("MQTT_TOPIC", "#")); // your note
     snprintf(g_db_path, sizeof(g_db_path), "%s", env_or_default("MQTT_DB_PATH", "./mqtt_messages.db"));
     snprintf(g_netfix_script, sizeof(g_netfix_script), "%s", env_or_default("NETWORK_FIX_SCRIPT", "./handle_network_error.sh"));
     g_reconnect_min = env_or_default_int("RECONNECT_MIN_S", 2);
     g_reconnect_max = env_or_default_int("RECONNECT_MAX_S", 60);
+    g_sleep_after_script = env_or_default_int("RETRY_SLEEP_AFTER_SCRIPT_S", 5);
 
     install_sig_handlers();
 
@@ -270,7 +288,6 @@ int main(void) {
 
     mosquitto_lib_init();
 
-    // Client ID (optional env)
     const char *cid_env = getenv("MQTT_CLIENT_ID");
     char cid_buf[64];
     if (!cid_env || !*cid_env) {
@@ -290,27 +307,68 @@ int main(void) {
     mosquitto_disconnect_callback_set(g_mosq, handle_disconnect);
     mosquitto_message_callback_set(g_mosq, handle_message);
 
-    // Automatic reconnect with backoff
+    // Configure internal backoff (not strictly needed in manual loop but ok)
     mosquitto_reconnect_delay_set(g_mosq, true, g_reconnect_min, g_reconnect_max);
 
-    int rc = mosquitto_connect(g_mosq, g_broker_host, g_broker_port, /*keepalive*/ 30);
+    // Initial connect (non-fatal on failure)
+    int rc = mosquitto_connect(g_mosq, g_broker_host, g_broker_port, 30);
     if (rc != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "Initial connect failed: %s\n", mosquitto_strerror(rc));
+        char buf[160];
+        snprintf(buf, sizeof(buf), "Initial connect failed: %s", mosquitto_strerror(rc));
+        log_ts("WARN", buf);
+    }
+
+    // Manual loop: keep going until signaled to stop.
+    int backoff = g_reconnect_min;
+    while (!g_should_stop) {
+        rc = mosquitto_loop(g_mosq, /*timeout_ms*/ 1000, /*max_packets*/ 1);
+        if (rc == MOSQ_ERR_SUCCESS) {
+            // Healthy loop iteration.
+            backoff = g_reconnect_min; // reset backoff on success
+            continue;
+        }
+
+        // Any error: connection likely lost or not yet established.
+        char buf[200];
+        snprintf(buf, sizeof(buf), "mosquitto_loop error: %s", mosquitto_strerror(rc));
+        log_ts("WARN", buf);
+
+        // Try to repair network; then sleep a bit for routes/ppp to settle.
         run_network_repair_script();
-        // We still proceed to loop_forever; it will attempt reconnects.
+
+        if (g_sleep_after_script > 0) {
+            char m2[120];
+            snprintf(m2, sizeof(m2), "Sleeping %d s after repair script…", g_sleep_after_script);
+            log_ts("INFO", m2);
+            for (int i = 0; i < g_sleep_after_script && !g_should_stop; ++i) sleep(1);
+        }
+
+        // Reconnect loop with exponential backoff
+        while (!g_should_stop) {
+            int rc2 = mosquitto_reconnect(g_mosq);
+            if (rc2 == MOSQ_ERR_SUCCESS) {
+                log_ts("INFO", "Reconnected successfully.");
+                backoff = g_reconnect_min;
+                break; // back to main loop; subscribe happens in on_connect
+            }
+
+            snprintf(buf, sizeof(buf), "Reconnect failed: %s. Retrying in %d s…",
+                     mosquitto_strerror(rc2), backoff);
+            log_ts("WARN", buf);
+
+            for (int i = 0; i < backoff && !g_should_stop; ++i) sleep(1);
+            if (backoff < g_reconnect_max) {
+                backoff *= 2;
+                if (backoff > g_reconnect_max) backoff = g_reconnect_max;
+            }
+        }
     }
 
-    // This handles reconnects automatically thanks to reconnect_delay_set()
-    rc = mosquitto_loop_forever(g_mosq, -1, 1);
-
-    if (rc != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "mosquitto_loop_forever ended: %s\n", mosquitto_strerror(rc));
-    }
-
+    log_ts("INFO", "Shutting down…");
+    mosquitto_disconnect(g_mosq);
     mosquitto_destroy(g_mosq);
     mosquitto_lib_cleanup();
     db_close();
-
     return 0;
 }
 
