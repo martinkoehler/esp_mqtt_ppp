@@ -1,56 +1,89 @@
 {
-  "id": null,
   "uid": "obk-power-energy",
   "title": "OpenBeken – Power & Energy",
-  "schemaVersion": 39,
+  "schemaVersion": 42,
   "version": 1,
-  "tags": ["OpenBeken","MQTT","SQLite"],
   "time": { "from": "now-24h", "to": "now" },
+  "tags": ["OpenBeken","MQTT","SQLite"],
   "templating": {
     "list": [
       {
+        "type": "textbox",
         "name": "device",
         "label": "Device",
-        "type": "textbox",
-        "query": "",
-        "current": { "text": "obk681BA32A", "value": "obk681BA32A" }
+        "query": "obk681BA32A",
+        "current": { "text": "obk681BA32A", "value": "obk681BA32A", "selected": true }
       }
     ]
   },
   "panels": [
     {
+      "id": 1,
       "type": "timeseries",
       "title": "Instant Power (W)",
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "gridPos": { "x": 0, "y": 0, "h": 8, "w": 24 },
+      "pluginVersion": "12.2.0",
+      "datasource": { "type": "frser-sqlite-datasource", "name": "MQTT SQLite" },
       "fieldConfig": {
-        "defaults": { "unit": "watt", "custom": { "drawStyle": "line", "lineInterpolation": "smooth" } },
+        "defaults": {
+          "unit": "watt",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
         "overrides": []
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "options": {
+        "tooltip": { "mode": "single", "sort": "none", "hideZeros": false },
+        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": [] }
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "frser-sqlite-datasource", "name": "MQTT SQLite" },
-          "format": "table",
-          "queryText": "SELECT ts*1000 AS time, CAST(payload AS REAL) AS value\nFROM messages\nWHERE topic = '${device}/power/get'\nORDER BY ts;"
+          "queryType": "table",
+          "rawQueryText": "SELECT ts AS time, CAST(payload AS REAL) AS value\nFROM messages\nWHERE topic = '${device}/power/get'\n  AND ts BETWEEN (${__from}/1000) AND (${__to}/1000)\nORDER BY ts;\n",
+          "timeColumns": ["time", "ts"]
         }
       ]
     },
     {
+      "id": 2,
       "type": "timeseries",
       "title": "Total Energy (kWh)",
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+      "gridPos": { "x": 0, "y": 8, "h": 8, "w": 24 },
+      "pluginVersion": "12.2.0",
+      "datasource": { "type": "frser-sqlite-datasource", "name": "MQTT SQLite" },
       "fieldConfig": {
-        "defaults": { "unit": "kwh", "custom": { "drawStyle": "line", "lineInterpolation": "stepBefore" } },
+        "defaults": {
+          "unit": "kwh",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepBefore",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
         "overrides": []
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "options": {
+        "tooltip": { "mode": "single", "sort": "none", "hideZeros": false },
+        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": [] }
+      },
       "targets": [
         {
           "refId": "B",
-          "datasource": { "type": "frser-sqlite-datasource", "name": "MQTT SQLite" },
-          "format": "table",
-          "queryText": "SELECT ts*1000 AS time, CAST(payload AS REAL) AS value\nFROM messages\nWHERE topic = '${device}/energycounter/get'\nORDER BY ts;"
+          "queryType": "table",
+          "rawQueryText": "SELECT ts AS time, CAST(payload AS REAL) AS value\nFROM messages\nWHERE topic = '${device}/energycounter/get'\n  AND ts BETWEEN (${__from}/1000) AND (${__to}/1000)\nORDER BY ts;\n",
+          "timeColumns": ["time", "ts"]
         }
       ]
     }
