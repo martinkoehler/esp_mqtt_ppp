@@ -119,15 +119,43 @@ static void saveBootDiag() { EEPROM.put(DIAG_ADDR, g_bootdiag); EEPROM.commit();
 // ============================= Netif Utils ====================================
 
 static void dump_netifs_to(String& out, const char* tag) {
-  out += "[NETIF] "; out += tag; out += "\n";
+  out += "[NETIF] ";
+  out += tag;
+  out += "\n";
+
   for (netif* n = netif_list; n; n = n->next) {
-    ip4_addr_t ip = *netif_ip4_addr(n); ip4_addr_t gw = *netif_ip4_gw(n); ip4_addr_t mk = *netif_ip4_netmask(n);
-    char line[160];
-    snprintf(line,sizeof(line),"  #%u %c%c  ip=%s gw=%s mask=%s flags=0x%02x\n",
-             n->num,n->name[0],n->name[1], ipaddr_ntoa(&ip), ipaddr_ntoa(&gw), ipaddr_ntoa(&mk), n->flags);
+#if LWIP_IPV4
+    const ip4_addr_t* ip = netif_ip4_addr(n);
+    const ip4_addr_t* gw = netif_ip4_gw(n);
+    const ip4_addr_t* mk = netif_ip4_netmask(n);
+
+    // Re-entrant conversion buffers (enough for IPv4 "255.255.255.255" + NUL)
+    char ipbuf[16], gwbuf[16], mkbuf[16];
+    ip4addr_ntoa_r(ip, ipbuf, sizeof(ipbuf));
+    ip4addr_ntoa_r(gw, gwbuf, sizeof(gwbuf));
+    ip4addr_ntoa_r(mk, mkbuf, sizeof(mkbuf));
+#else
+    // Fallback (shouldn't happen on ESP8266/lwIP2, which is IPv4)
+    const char* ipbuf = "0.0.0.0";
+    const char* gwbuf = "0.0.0.0";
+    const char* mkbuf = "0.0.0.0";
+#endif
+
+    char line[192];
+    // Keep your original layout; add quick state hints (UP/LINK) at the end
+    snprintf(line, sizeof(line),
+             "  #%u %c%c  ip=%s gw=%s mask=%s flags=0x%02x%s%s\n",
+             n->num, n->name[0], n->name[1],
+             ipbuf, gwbuf, mkbuf, n->flags,
+             netif_is_up(n) ? " UP" : "",
+             netif_is_link_up(n) ? " LINK" : "");
+
     out += line;
   }
 }
+
+
+
 static void dump_netifs(const char* tag) { String tmp; dump_netifs_to(tmp, tag); Serial1.print(tmp); }
 
 // ============================== AP Bring-up ===================================
@@ -324,7 +352,7 @@ static void setupWeb() {
 static inline void serviceMQTT() {
   broker.loop();
   lastMQTTLoopTouchMs = millis();
-  yield();
+  // yield();
 }
 
 static void setupMQTT() {
