@@ -3,7 +3,7 @@ USB-serial control lines the same way Arduino IDE/esptool do.
 It does not require the board to respond over serial (it only toggles DTR/RTS), 
 so it works whenever /dev/ttyUSB0 has been released
 
-How it works (tl;dr)
+#How it works (tl;dr)
 
 On typical WeMos/NodeMCU auto-reset circuits:
 
@@ -17,8 +17,14 @@ Deassert DTR → lets GPIO0 stay HIGH (so we won’t enter bootloader).
 
 Pulse RTS (assert → short delay → deassert) → pulls RESET low briefly, causing a reset
 
-Building without make
+#Usage:
+make           # builds mqtt_to_sqlite and reset_wemos
+make reset     # runs ./reset_wemos /dev/ttyUSB0 120
+# or:
+make reset DEV=/dev/ttyUSB1 PULSE_MS=200
 
+
+#Building without make
 
 gcc -O2 -Wall -o reset_wemos reset_wemos.c
 # If PPPD has exited and released the serial device:
@@ -26,14 +32,14 @@ gcc -O2 -Wall -o reset_wemos reset_wemos.c
 ./reset_wemos /dev/ttyUSB0 200     # custom pulse width
 
 
-Notes & tips
+#Notes & tips
 
 Permissions: You’ll need access to the device node. On many distros, add your user to the dialout group, or run with sudo.
 
 PPP cleanup: Your scenario assumes PPPD has already shut down so the port is free. If a lock file remains 
 (e.g., /var/lock/LCK..ttyUSB0), make sure PPPD is actually stopped before running this.
 
-Bootloader vs normal boot:
+#Bootloader vs normal boot:
 
 The sequence above forces a normal boot hard reset (GPIO0 high during reset).
 
