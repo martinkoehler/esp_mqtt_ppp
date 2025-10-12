@@ -1,0 +1,44 @@
+reset_wemos.c is a tiny Linux C program that “hard resets” a WeMos D1 (ESP8266) by manipulating the 
+USB-serial control lines the same way Arduino IDE/esptool do. 
+It does not require the board to respond over serial (it only toggles DTR/RTS), 
+so it works whenever /dev/ttyUSB0 has been released
+
+How it works (tl;dr)
+
+On typical WeMos/NodeMCU auto-reset circuits:
+
+DTR is wired (via a transistor/inverter) to GPIO0
+
+RTS is wired (via a transistor/inverter) to RESET
+
+To force a normal boot hard reset:
+
+Deassert DTR → lets GPIO0 stay HIGH (so we won’t enter bootloader).
+
+Pulse RTS (assert → short delay → deassert) → pulls RESET low briefly, causing a reset
+
+Building without make
+
+
+gcc -O2 -Wall -o reset_wemos reset_wemos.c
+# If PPPD has exited and released the serial device:
+./reset_wemos /dev/ttyUSB0         # pulses RESET ~120 ms
+./reset_wemos /dev/ttyUSB0 200     # custom pulse width
+
+
+Notes & tips
+
+Permissions: You’ll need access to the device node. On many distros, add your user to the dialout group, or run with sudo.
+
+PPP cleanup: Your scenario assumes PPPD has already shut down so the port is free. If a lock file remains 
+(e.g., /var/lock/LCK..ttyUSB0), make sure PPPD is actually stopped before running this.
+
+Bootloader vs normal boot:
+
+The sequence above forces a normal boot hard reset (GPIO0 high during reset).
+
+If you ever need to enter the ROM bootloader (like Arduino IDE/esptool flashing), do the opposite: 
+assert DTR (so GPIO0 is held low), then pulse RTS.
+
+Adapters: Works with common CH340/CP210x/FTDI adapters; the logic relies on the standard DTR/RTS modem control lines 
+and the typical WeMos auto-reset transistor inverters.
