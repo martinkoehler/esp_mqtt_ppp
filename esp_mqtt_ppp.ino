@@ -521,9 +521,9 @@ void setup() {
 }
 
 void loop() {
+  serviceMQTT();
   servicePPP();
   serviceHTTP();
-  serviceMQTT();
   serviceHealth();
   yield();
 }
