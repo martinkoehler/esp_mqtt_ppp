@@ -352,7 +352,7 @@ static void setupWeb() {
 static inline void serviceMQTT() {
   broker.loop();
   lastMQTTLoopTouchMs = millis();
-  // yield();
+  yield();
 }
 
 static void setupMQTT() {
