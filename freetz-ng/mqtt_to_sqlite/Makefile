@@ -4,7 +4,8 @@
 #   sudo apt-get install build-essential pkg-config libmosquitto-dev libsqlite3-dev
 #
 # Usage:
-#   make            # build mqtt_to_sqlite
+#   make            # build mqtt_to_sqlite and reset_wemos
+#   make reset      # hard-reset the WeMos/ESP via /dev/ttyUSB0 (customize DEV/PULSE_MS)
 #   make clean
 #
 # Cross-compile hint for FreetzNG:
@@ -17,9 +18,18 @@
 # Optional static link (only if your toolchain supports it):
 #   make STATIC=1
 
-APP      := mqtt_to_sqlite
-SRC      := mqtt_to_sqlite.c
-OBJ      := $(SRC:.c=.o)
+APP       := mqtt_to_sqlite
+SRC       := mqtt_to_sqlite.c
+OBJ       := $(SRC:.c=.o)
+
+# ---- Reset helper (new) ----
+RESET_APP := reset_wemos
+RESET_SRC := reset_wemos.c
+RESET_OBJ := $(RESET_SRC:.c=.o)
+
+# Runtime convenience for `make reset`
+DEV      ?= /dev/ttyUSB0
+PULSE_MS ?= 120
 
 PKG_LIBS := libmosquitto sqlite3
 
@@ -30,7 +40,7 @@ OPT      ?= -O2
 DEFS     ?=
 
 # Allow extra flags from env
-CFLAGS_EXTRA ?=
+CFLAGS_EXTRA  ?=
 LDFLAGS_EXTRA ?=
 
 # Prefer pkg-config for portable flags
@@ -39,24 +49,25 @@ LIBS_PKG   := $(shell pkg-config --libs   $(PKG_LIBS) 2>/dev/null)
 
 # Fallback if pkg-config missing (common on embedded toolchains)
 ifeq ($(strip $(CFLAGS_PKG)),)
-  CFLAGS_PKG := 
+  CFLAGS_PKG :=
 endif
 ifeq ($(strip $(LIBS_PKG)),)
   LIBS_PKG := -lmosquitto -lsqlite3
 endif
 
-CFLAGS := $(CSTD) $(WARN) $(OPT) $(DEFS) $(CFLAGS_PKG) $(CFLAGS_EXTRA)
+CFLAGS  := $(CSTD) $(WARN) $(OPT) $(DEFS) $(CFLAGS_PKG) $(CFLAGS_EXTRA)
 LDFLAGS := $(LDFLAGS_EXTRA)
-LIBS := $(LIBS_PKG)
+LIBS    := $(LIBS_PKG)
 
 # Optional static link
 ifeq ($(STATIC),1)
   LDFLAGS += -static
 endif
 
-.PHONY: all clean
+.PHONY: all clean reset
 
-all: $(APP)
+# Build both tools by default
+all: $(APP) $(RESET_APP)
 
 $(APP): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
@@ -64,6 +75,14 @@ $(APP): $(OBJ)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# ---- reset_wemos build (no extra libs needed) ----
+$(RESET_APP): $(RESET_OBJ)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+# Convenience target: pulse RESET on the WeMos/ESP
+reset: $(RESET_APP)
+	./$(RESET_APP) "$(DEV)" "$(PULSE_MS)"
+
 clean:
-	rm -f $(APP) $(OBJ)
+	rm -f $(APP) $(OBJ) $(RESET_APP) $(RESET_OBJ)
 
