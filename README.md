@@ -149,3 +149,10 @@ or
 ```sh
 sudo iptables-restore < /etc/iptables/rules.v4
 ```
+
+## Fritz Box routing
+If the Wemos is connected to another host in the network you can set up routing at the Fritz box via
+
+```sh
+route add -net 192.168.4.0 netmask 255.255.255.0 gw 192.168.178.60
+```
