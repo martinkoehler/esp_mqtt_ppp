@@ -187,7 +187,10 @@ static void rememberClientIP(const IPAddress& ip) {
 // WiFi event: DHCP server on AP assigned an IP to a station
 static void onApStaIpAssigned(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (event != ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED) return;
-  IPAddress ip(info.ap_staipassigned.ip.addr);
+
+  // field name changed in newer cores
+  IPAddress ip(info.wifi_ap_staipassigned.ip.addr);
+
   rememberClientIP(ip);
   Serial1.print("[AP] STA got IP: ");
   Serial1.println(ip);
@@ -244,10 +247,12 @@ static void loadAPConfig() {
 // ========================= PPP Bring-up =======================================
 
 // PPP output callback: send bytes out via Serial (USB-UART to Linux host)
-static u32_t ppp_output_cb(ppp_pcb *pcb, u8_t *data, u32_t len, void *ctx) {
+static u32_t ppp_output_cb(ppp_pcb *pcb, const void *data, u32_t len, void *ctx) {
   (void)pcb;
   (void)ctx;
-  return Serial.write(data, len);
+
+  // Serial.write has overloads for const uint8_t*/const char*
+  return Serial.write(static_cast<const uint8_t*>(data), len);
 }
 
 // PPP status callback: **no heavy work / logging here**; just set flags
