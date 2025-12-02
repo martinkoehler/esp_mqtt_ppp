@@ -10,7 +10,6 @@
 
 #include <mosquitto.h>
 #include <sqlite3.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/wait.h>
 
 static volatile sig_atomic_t g_should_stop = 0;
 
@@ -25,7 +25,7 @@ static sqlite3 *g_db = NULL;
 static sqlite3_stmt *g_stmt_insert = NULL;
 static struct mosquitto *g_mosq = NULL;
 
-static char g_broker_host[128] = "192.168.4.1";
+static char g_broker_host[128] = "192.168.178.50";
 static int  g_broker_port = 1883;
 static char g_topic[128] = "#";  // subscribe to all (your request)
 static char g_db_path[256] = "./mqtt_messages.db";
@@ -270,7 +270,7 @@ static void install_sig_handlers(void) {
 
 int main(void) {
     // Env overrides
-    snprintf(g_broker_host, sizeof(g_broker_host), "%s", env_or_default("MQTT_BROKER", "192.168.4.1"));
+    snprintf(g_broker_host, sizeof(g_broker_host), "%s", env_or_default("MQTT_BROKER", "192.168.178.50"));
     g_broker_port = env_or_default_int("MQTT_PORT", 1883);
     snprintf(g_topic, sizeof(g_topic), "%s", env_or_default("MQTT_TOPIC", "#")); // your note
     snprintf(g_db_path, sizeof(g_db_path), "%s", env_or_default("MQTT_DB_PATH", "./mqtt_messages.db"));
