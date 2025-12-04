@@ -60,11 +60,40 @@ Create `/mod/etc/httpd.passwd` on a PC (Apache htpasswd format) and copy it over
 Create `/mod/www/cgi-bin/mqtt.sh`:
 
 ```sh
+#!/bin/sh
+DB="/var/media/ftp/Verbatim-STORENGO-01/mqtt_messages.db"  # <- adjust if needed
+SQLITE="/usr/bin/sqlite3"
+
+echo "Content-Type: application/json"
+echo ""
+
+# decode query parameters
+QS="$(busybox httpd -d "$QUERY_STRING")"
+getp() { echo "$QS" | tr '&' '\n' | sed -n "s/^$1=//p" | head -n1; }
+
+mode="$(getp mode)"      # num (default) or json
+topic="$(getp topic)"    # exact topic filter
+from="$(getp from)"      # unix seconds
+to="$(getp to)"          # unix seconds
+limit="$(getp limit)"
+
+[ -z "$mode" ] && mode="num"
+[ -z "$limit" ] && limit=5000
+
+now="$(date +%s)"
+[ -z "$to" ] && to="$now"
+[ -z "$from" ] && from="$((now-6*3600))"
+
+WHERE="ts BETWEEN $from AND $to"
+if [ -n "$topic" ]; then
+  topic="$(echo "$topic" | sed 's/"/""/g')"
+  WHERE="$WHERE AND topic=\"$topic\""
+fi
 case "$mode" in
   num)
     $SQLITE -readonly -json \
       -cmd "PRAGMA query_only=ON;" \
-      -cmd "PRAGMA busy_timeout=2000;" \
+      -cmd ".timeout 2000" \
       "$DB" "
       SELECT
         ts*1000 AS time,
@@ -85,7 +114,7 @@ case "$mode" in
   json)
     $SQLITE -readonly -json \
       -cmd "PRAGMA query_only=ON;" \
-      -cmd "PRAGMA busy_timeout=2000;" \
+      -cmd ".timeout 2000" \
       "$DB" "
       SELECT ts*1000 AS time, topic, payload
       FROM messages
